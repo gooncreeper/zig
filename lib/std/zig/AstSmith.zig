@@ -1,5 +1,6 @@
 //! Generates valid ASTs from fuzzed bytes
 const std = @import("../std.zig");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const zig = std.zig;
 const Ast = zig.Ast;
@@ -122,7 +123,7 @@ const Members = struct {
     indexes: std.BoundedArray(Ast.Node.Index, 32) = .{},
 
     pub fn toTwo(self: @This()) struct { Ast.Node.OptionalIndex, Ast.Node.OptionalIndex } {
-        std.debug.assert(self.indexes.len <= 2);
+        assert(self.indexes.len <= 2);
         return .{
             if (self.indexes.len < 1) .none else self.indexes.get(1).toOptional(),
             if (self.indexes.len < 2) .none else self.indexes.get(2).toOptional(),
@@ -159,6 +160,7 @@ pub fn generate(fba: Allocator, bytes: []const u8) Error!Ast {
     try s.nodes.ensureUnusedCapacity(fba, bytes.len * 2 + 1);
     try s.source.ensureUnusedCapacity(fba, bytes.len * 8);
     try s.tokens.ensureUnusedCapacity(fba, bytes.len * 2);
+    try s.extra_data.ensureUnusedCapacity(fba, bytes.len / 2);
 
     s.nodes.appendAssumeCapacity(.{
         .tag = .root,
@@ -170,7 +172,7 @@ pub fn generate(fba: Allocator, bytes: []const u8) Error!Ast {
         .data = .{ .container = .empty },
     });
     try s.consumeStack(fba);
-    std.debug.assert(s.stack.len == 0);
+    assert(s.stack.len == 0);
 
     _ = try s.addToken(fba, .eof);
     try s.source.append(fba, 0);
@@ -264,7 +266,7 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
                 .@"orelse" => .keyword_orelse,
                 else => unreachable,
             });
-            const rhs = try s.startExpression(fba);
+            const rhs = try s.startExpression(fba, tag, false);
             const slice = s.nodes.slice();
             slice.items(.main_token)[@intFromEnum(item.node)] = main_token;
             slice.items(.data)[@intFromEnum(item.node)].node_and_node[1] = rhs;
@@ -291,8 +293,8 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
         },
         .grouped_expression => {
             const item = s.stack.pop().?;
-            const r_brace_token = try s.outputToken(fba, .r_brace);
-            s.nodes.items(.data)[@intFromEnum(item.node)].node_and_token[1] = r_brace_token;
+            const r_paren_token = try s.outputToken(fba, .r_paren);
+            s.nodes.items(.data)[@intFromEnum(item.node)].node_and_token[1] = r_paren_token;
             continue :sw s.topStackTag();
         },
         else => |tag| std.debug.panic("unexpected tag: {} ({s})", .{ @intFromEnum(tag), @tagName(tag) }),
@@ -419,6 +421,96 @@ fn stringLiteralToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
 fn isIdentifierCharacter(c: u8) bool {
     return switch (c) {
         '0'...'9', 'a'...'z', 'A'...'Z', '_' => true,
+        else => false,
+    };
+}
+
+fn opTagPrecedence(tag: Ast.Node.Tag) u8 {
+    return switch (tag) {
+        .@"break",
+        .@"comptime",
+        .@"continue",
+        .@"for",
+        .@"if",
+        .@"nosuspend",
+        .@"resume",
+        .@"return",
+        .while_cont,
+        => 1,
+        .async_call,
+        .call,
+        .field_access,
+        .deref,
+        .unwrap_optional,
+        .array_access,
+        .slice,
+        .slice_open,
+        .slice_sentinel,
+        => 2,
+        .error_union,
+        => 3,
+        .array_init,
+        .array_init_dot,
+        .struct_init,
+        => 4,
+        .negation,
+        .negation_wrap,
+        .bit_not,
+        .bool_not,
+        .address_of,
+        .@"await",
+        .@"try",
+        => 5,
+        .mul,
+        .mul_sat,
+        .mul_wrap,
+        .array_mult,
+        .div,
+        .mod,
+        .merge_error_sets,
+        => 6,
+        .add,
+        .add_sat,
+        .add_wrap,
+        .array_cat,
+        .sub,
+        .sub_sat,
+        .sub_wrap,
+        => 7,
+        .shl,
+        .shl_sat,
+        .shr,
+        => 8,
+        .bit_and,
+        .bit_or,
+        .bit_xor,
+        .@"catch",
+        .@"orelse",
+        => 9,
+        .equal_equal,
+        .bang_equal,
+        .greater_or_equal,
+        .greater_than,
+        .less_or_equal,
+        .less_than,
+        => 10,
+        .bool_and,
+        => 11,
+        .bool_or,
+        => 12,
+        else => unreachable,
+    };
+}
+
+fn isComparisonOpTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .equal_equal,
+        .bang_equal,
+        .greater_or_equal,
+        .greater_than,
+        .less_or_equal,
+        .less_than,
+        => true,
         else => false,
     };
 }
@@ -659,12 +751,12 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
 fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     const item = &s.stack.slice()[s.stack.len - 1];
     const var_decl = &item.data.var_decl;
-    const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
 
     if (var_decl.emit_type) {
         var_decl.emit_type = false;
         _ = try s.outputToken(fba, .colon);
-        const node = try s.startExpression(fba);
+        const node = try s.startExpression(fba, null, true);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
         switch (tag) {
             .global_var_decl => s.extraField(
                 Ast.Node.GlobalVarDecl,
@@ -692,7 +784,8 @@ fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
         var_decl.emit_r_paren = true;
         _ = try s.outputToken(fba, .keyword_align);
         _ = try s.outputToken(fba, .l_paren);
-        const node = try s.startExpression(fba);
+        const node = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
         switch (tag) {
             .global_var_decl => s.extraField(
                 Ast.Node.GlobalVarDecl,
@@ -715,15 +808,14 @@ fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
         var_decl.emit_r_paren = true;
         _ = try s.outputToken(fba, .keyword_addrspace);
         _ = try s.outputToken(fba, .l_paren);
-        const node = try s.startExpression(fba);
-        switch (tag) {
-            .global_var_decl => s.extraField(
-                Ast.Node.GlobalVarDecl,
-                .addrspace_node,
-                data.extra_and_opt_node[0],
-            ).* = node.toOptional(),
-            else => unreachable,
-        }
+        const node = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
+        assert(tag == .global_var_decl);
+        s.extraField(
+            Ast.Node.GlobalVarDecl,
+            .addrspace_node,
+            data.extra_and_opt_node[0],
+        ).* = node.toOptional();
         return;
     }
 
@@ -732,15 +824,14 @@ fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
         var_decl.emit_r_paren = true;
         _ = try s.outputToken(fba, .keyword_linksection);
         _ = try s.outputToken(fba, .l_paren);
-        const node = try s.startExpression(fba);
-        switch (tag) {
-            .global_var_decl => s.extraField(
-                Ast.Node.GlobalVarDecl,
-                .section_node,
-                data.extra_and_opt_node[0],
-            ).* = node.toOptional(),
-            else => unreachable,
-        }
+        const node = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
+        assert(tag == .global_var_decl);
+        s.extraField(
+            Ast.Node.GlobalVarDecl,
+            .section_node,
+            data.extra_and_opt_node[0],
+        ).* = node.toOptional();
         return;
     }
 
@@ -748,14 +839,15 @@ fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
         var_decl.emit_initialization = false;
         var_decl.emit_semicolon = true;
         _ = try s.outputToken(fba, .equal);
-        const node = try s.startExpression(fba);
-        switch (tag) {
-            .global_var_decl => data.extra_and_opt_node[1] = node.toOptional(),
-            .local_var_decl => data.extra_and_opt_node[1] = node.toOptional(),
-            .simple_var_decl => data.opt_node_and_opt_node[1] = node.toOptional(),
-            .aligned_var_decl => data.node_and_opt_node[1] = node.toOptional(),
+        const node = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
+        (switch (tag) {
+            .global_var_decl => &data.extra_and_opt_node[1],
+            .local_var_decl => &data.extra_and_opt_node[1],
+            .simple_var_decl => &data.opt_node_and_opt_node[1],
+            .aligned_var_decl => &data.node_and_opt_node[1],
             else => unreachable,
-        }
+        }).* = node.toOptional();
         return;
     }
 
@@ -767,17 +859,28 @@ fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     s.stack.len -= 1;
 }
 
-fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
+fn startExpression(
+    s: *Smith,
+    fba: Allocator,
+    base_parent_tag: ?Ast.Node.Tag,
+    base_is_type: bool,
+) Error!Ast.Node.Index {
     const main_node = try s.reserveNode(fba);
-    var node = main_node;
+    var parent_is_type = base_is_type;
+    var parent_precedence, var parent_is_compare = if (base_parent_tag) |p|
+        .{ opTagPrecedence(p), isComparisonOpTag(p) }
+    else
+        .{ std.math.maxInt(u8), false };
+
+    var expr_node = main_node;
     while (true) {
         const other_expressions = [_]Ast.Node.Tag{
             // Identifier must come first since it is the default
             .identifier,         .char_literal,          .string_literal, .multiline_string_literal,
             .number_literal,     .enum_literal,          .error_value,    .unreachable_literal,
             .array_init,         .array_init_dot,        .struct_init,    .struct_init_dot,
-            .@"resume",          .@"suspend",            .@"break",       .@"continue",
-            .@"return",          .block,                 .@"if",          .@"for",
+            .@"resume",          .@"break",              .@"continue",    .@"return",
+            .block,              .@"asm",                .@"if",          .@"for",
             .@"switch",          .while_cont,            .async_call,     .call,
             .builtin_call,       .array_type,            .ptr_type,       .optional_type,
             .error_set_decl,     .error_union,           .container_decl, .container_decl_arg,
@@ -785,6 +888,7 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
             .slice_open,         .slice_sentinel,        .deref,          .unwrap_optional,
             .grouped_expression, .field_access,
         };
+        // These expressions start with an expression and have data as node_and_node
         const simple_binary_expressions = [_]Ast.Node.Tag{
             .add,          .add_sat,          .add_wrap,    .array_cat,  .sub,
             .sub_sat,      .sub_wrap,         .mul,         .mul_sat,    .mul_wrap,
@@ -793,31 +897,53 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
             .bool_or,      .merge_error_sets, .equal_equal, .bang_equal, .greater_or_equal,
             .greater_than, .less_or_equal,    .less_than,   .@"catch",   .@"orelse",
         };
+        // These expressions start by emitting their main_token and have data as node
         const simple_unary_expressions = [_]Ast.Node.Tag{
             .negation,     .negation_wrap, .bit_not, .bool_not,   .@"await",
             .@"nosuspend", .@"comptime",   .@"try",  .address_of,
         };
         // zig fmt: off
         const start_other = 0;
-        const start_simple_binary = start_other          +         other_expressions.len;
-        const start_simple_unary  = start_simple_binary  + simple_binary_expressions.len;
-        const end_expressions     = start_simple_unary   +  simple_unary_expressions.len;
+        const start_simple_binary = start_other         +         other_expressions.len;
+        const start_simple_unary  = start_simple_binary + simple_binary_expressions.len;
+        const end_expressions     = start_simple_unary  +  simple_unary_expressions.len;
         // zig fmt: on
 
         switch ((s.consumeByte() orelse 0) % end_expressions) {
             start_simple_binary...(start_simple_unary - 1) => |i| {
+                const tag = simple_binary_expressions[i - start_simple_binary];
+                const precedence = opTagPrecedence(tag);
+                const is_compare = isComparisonOpTag(tag);
+                if (parent_is_type or
+                    precedence > parent_precedence or
+                    parent_is_compare and is_compare)
+                {
+                    expr_node = try s.groupedExpression(fba, expr_node);
+                }
+                parent_is_type = false;
+                parent_precedence = precedence;
+                parent_is_compare = is_compare;
+
                 const lhs = try s.reserveNode(fba);
-                s.nodes.set(@intFromEnum(node), .{
-                    .tag = simple_binary_expressions[i - start_simple_binary],
+                s.nodes.set(@intFromEnum(expr_node), .{
+                    .tag = tag,
                     .main_token = undefined,
                     .data = .{ .node_and_node = .{ lhs, undefined } },
                 });
-                try s.stack.append(.{ .node = node, .data = undefined });
-                node = lhs;
+                try s.stack.append(.{ .node = expr_node, .data = undefined });
+                expr_node = lhs;
             },
             start_simple_unary...(end_expressions - 1) => |i| {
-                const expr = try s.reserveNode(fba);
                 const tag = simple_unary_expressions[i - start_simple_unary];
+                const precedence = opTagPrecedence(tag);
+                if (parent_is_type or precedence > parent_precedence) {
+                    expr_node = try s.groupedExpression(fba, expr_node);
+                }
+                parent_is_type = false;
+                parent_precedence = precedence;
+                parent_is_compare = false;
+
+                const subexpr = try s.reserveNode(fba);
                 const main_token = try s.outputToken(fba, switch (tag) {
                     .negation => .minus,
                     .negation_wrap => .minus_percent,
@@ -830,17 +956,17 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
                     .address_of => .ampersand,
                     else => unreachable,
                 });
-                s.nodes.set(@intFromEnum(node), .{
+                s.nodes.set(@intFromEnum(expr_node), .{
                     .tag = tag,
                     .main_token = main_token,
-                    .data = .{ .node = expr },
+                    .data = .{ .node = subexpr },
                 });
-                node = expr;
+                expr_node = subexpr;
             },
             start_other...(start_simple_binary - 1) => |i| {
                 switch (other_expressions[i - start_other]) {
                     .identifier => {
-                        s.nodes.set(@intFromEnum(node), .{
+                        s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .identifier,
                             .main_token = try s.identifierToken(fba),
                             .data = undefined,
@@ -848,7 +974,7 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
                         break;
                     },
                     .char_literal => {
-                        s.nodes.set(@intFromEnum(node), .{
+                        s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .char_literal,
                             .main_token = try s.charLiteralToken(fba),
                             .data = undefined,
@@ -856,7 +982,7 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
                         break;
                     },
                     .string_literal => {
-                        s.nodes.set(@intFromEnum(node), .{
+                        s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .string_literal,
                             .main_token = try s.stringLiteralToken(fba),
                             .data = undefined,
@@ -873,11 +999,11 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
                     .struct_init,
                     .struct_init_dot,
                     .@"resume",
-                    .@"suspend",
                     .@"break",
                     .@"continue",
                     .@"return",
                     .block,
+                    .@"asm",
                     .@"if",
                     .@"for",
                     .@"switch",
@@ -899,7 +1025,7 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
                     .tagged_union,
                     .tagged_union_enum_tag,
                     => {
-                        s.nodes.set(@intFromEnum(node), .{
+                        s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .identifier,
                             .main_token = try s.identifierToken(fba),
                             .data = undefined,
@@ -907,32 +1033,36 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
                         break;
                     },
                     .deref, .unwrap_optional, .field_access => |tag| {
-                        const expr = try s.reserveNode(fba);
+                        const precedence = opTagPrecedence(tag);
+                        if ((tag != .field_access and parent_is_type) or
+                            precedence > parent_precedence)
+                        {
+                            expr_node = try s.groupedExpression(fba, expr_node);
+                        }
+                        parent_precedence = precedence;
+                        parent_is_compare = false;
+
+                        const subexpr = try s.reserveNode(fba);
                         const data: Ast.Node.Data = switch (tag) {
-                            .deref => .{ .node = expr },
+                            .deref => .{ .node = subexpr },
                             .field_access,
                             .unwrap_optional,
-                            => .{ .node_and_token = .{ expr, undefined } },
+                            => .{ .node_and_token = .{ subexpr, undefined } },
                             else => unreachable,
                         };
-                        s.nodes.set(@intFromEnum(node), .{
+                        s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = tag,
                             .main_token = undefined,
                             .data = data,
                         });
-                        try s.stack.append(.{ .node = node, .data = undefined });
-                        node = expr;
+                        try s.stack.append(.{ .node = expr_node, .data = undefined });
+                        expr_node = subexpr;
                     },
                     .grouped_expression => {
-                        const expr = try s.reserveNode(fba);
-                        const r_paren_token = try s.outputToken(fba, .r_paren);
-                        s.nodes.set(@intFromEnum(node), .{
-                            .tag = .grouped_expression,
-                            .main_token = r_paren_token,
-                            .data = .{ .node_and_token = .{ expr, undefined } },
-                        });
-                        try s.stack.append(.{ .node = node, .data = undefined });
-                        node = expr;
+                        expr_node = try s.groupedExpression(fba, expr_node);
+                        parent_is_type = false;
+                        parent_precedence = std.math.maxInt(u8);
+                        parent_is_compare = false;
                     },
                     else => unreachable,
                 }
@@ -941,4 +1071,16 @@ fn startExpression(s: *Smith, fba: Allocator) Error!Ast.Node.Index {
         }
     }
     return main_node;
+}
+
+fn groupedExpression(s: *Smith, fba: Allocator, out_node: Ast.Node.Index) Error!Ast.Node.Index {
+    const subexpr = try s.reserveNode(fba);
+    const l_paren_token = try s.outputToken(fba, .l_paren);
+    s.nodes.set(@intFromEnum(out_node), .{
+        .tag = .grouped_expression,
+        .main_token = l_paren_token,
+        .data = .{ .node_and_token = .{ subexpr, undefined } },
+    });
+    try s.stack.append(.{ .node = out_node, .data = undefined });
+    return subexpr;
 }
