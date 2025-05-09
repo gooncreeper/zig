@@ -81,6 +81,7 @@ pub fn MultiArrayList(comptime T: type) type {
             };
 
             pub fn items(self: Slice, comptime field: Field) []FieldType(field) {
+                assert(self.len <= self.capacity);
                 const F = FieldType(field);
                 if (self.capacity == 0) {
                     return &[_]F{};
