@@ -61,7 +61,7 @@ const StackItem = struct {
         emit_semicolon: bool,
 
         pub fn init(in: ?u8, initialize: bool) VarDecl {
-            const emits: packed struct(u4) {
+            const emits: packed struct {
                 type: bool,
                 @"align": bool,
                 @"addrspace": bool,
@@ -125,8 +125,8 @@ const Members = struct {
     pub fn toTwo(self: @This()) struct { Ast.Node.OptionalIndex, Ast.Node.OptionalIndex } {
         assert(self.indexes.len <= 2);
         return .{
-            if (self.indexes.len < 1) .none else self.indexes.get(1).toOptional(),
-            if (self.indexes.len < 2) .none else self.indexes.get(2).toOptional(),
+            if (self.indexes.len < 1) .none else self.indexes.get(0).toOptional(),
+            if (self.indexes.len < 2) .none else self.indexes.get(1).toOptional(),
         };
     }
 
@@ -367,8 +367,8 @@ fn consumeByte(s: *Smith) ?u8 {
 }
 
 fn addToken(s: *Smith, fba: std.mem.Allocator, tag: Token.Tag) Error!Ast.TokenIndex {
+    const i = s.tokens.len;
     try s.tokens.append(fba, .{ .tag = tag, .start = @intCast(s.source.items.len) });
-    const i = s.tokens.len - 1;
     if (i == @intFromEnum(Ast.OptionalTokenIndex.none)) return error.Overflow;
     return @intCast(i);
 }
@@ -383,7 +383,16 @@ fn outputToken(s: *Smith, fba: Allocator, tag: Token.Tag) Error!Ast.TokenIndex {
     return token;
 }
 
-fn stringLiteral(s: *Smith, fba: Allocator, delim: u8) Error!void {
+/// Asserts tags.len != 0
+fn outputTokens(s: *Smith, fba: Allocator, tags: []const Token.Tag) Error!Ast.TokenIndex {
+    const first = s.outputToken(fba, tags[0]);
+    for (tags[1..]) |tag| {
+        _ = try s.outputToken(fba, tag);
+    }
+    return first;
+}
+
+fn string(s: *Smith, fba: Allocator, delim: u8) Error!void {
     var escape: bool = false;
     const string_len, const data_len = for (0.., s.in) |i, c| {
         if (c < ' ' or c == 0x7F) break .{ i, i + 1 };
@@ -406,23 +415,79 @@ fn stringLiteral(s: *Smith, fba: Allocator, delim: u8) Error!void {
     s.in = s.in[data_len..];
 }
 
-fn charLiteralToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
-    const token = try s.addToken(fba, .char_literal);
-    try s.stringLiteral(fba, '\'');
-    return token;
-}
-
 fn stringLiteralToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
     const token = try s.addToken(fba, .string_literal);
-    try s.stringLiteral(fba, '\"');
+    try s.string(fba, '"');
     return token;
 }
 
-fn isIdentifierCharacter(c: u8) bool {
-    return switch (c) {
-        '0'...'9', 'a'...'z', 'A'...'Z', '_' => true,
-        else => false,
+fn multilineStringLiteralTokens(s: *Smith, fba: Allocator) Error!struct {
+    Ast.TokenIndex,
+    Ast.TokenIndex,
+} {
+    const first_token = try s.addToken(fba, .multiline_string_literal_line);
+    var last_token = first_token;
+    try s.ensureUnusedSourceCapacity(fba, 2);
+    s.source.appendSliceAssumeCapacity("\\\\");
+
+    for (1.., s.in) |len, c| {
+        switch (c) {
+            '\n' => {
+                try s.ensureUnusedSourceCapacity(fba, 3);
+                s.source.appendSliceAssumeCapacity("\n");
+                last_token = try s.addToken(fba, .multiline_string_literal_line);
+                s.source.appendSliceAssumeCapacity("\\\\");
+            },
+            0...('\n' - 1), ('\n' + 1)...0x1f, 0x7f => {
+                s.in = s.in[0..len];
+                break;
+            },
+            else => {
+                try s.ensureUnusedSourceCapacity(fba, 1);
+                s.source.appendAssumeCapacity(c);
+            },
+        }
+    }
+    try s.ensureUnusedSourceCapacity(fba, 1);
+    s.source.appendSliceAssumeCapacity("\n");
+
+    return .{ first_token, last_token };
+}
+
+fn numberLiteralToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
+    var float: bool = false;
+    const number_len, const data_len = for (0.., s.in) |i, c| {
+        if (switch (c) {
+            '_', '0'...'9', 'a'...'z', 'A'...'Z' => {},
+            '.' => if (!float) {
+                float = true;
+            } else null,
+            '-', '+' => if (i != 0 and switch (s.in[i - 1]) {
+                'e', 'E', 'p', 'P' => true,
+                else => false,
+            }) {
+                float = true;
+            } else null,
+            else => null,
+        } == null) {
+            break .{ i, i + 1 };
+        }
+    } else .{ s.in.len, s.in.len };
+
+    const token = try s.addToken(fba, .number_literal);
+    try s.ensureUnusedSourceCapacity(fba, number_len + 3);
+    const invalid_start = number_len == 0 or switch (s.in[0]) {
+        '0'...'9' => false,
+        else => true,
     };
+    const incomplete_end = number_len != 0 and s.in[number_len - 1] == '.';
+
+    if (invalid_start) s.source.appendAssumeCapacity('0');
+    s.source.appendSliceAssumeCapacity(s.in[0..number_len]);
+    if (incomplete_end) s.source.appendAssumeCapacity('0');
+    s.source.appendAssumeCapacity(' ');
+    s.in = s.in[data_len..];
+    return token;
 }
 
 fn opTagPrecedence(tag: Ast.Node.Tag) u8 {
@@ -516,39 +581,29 @@ fn isComparisonOpTag(tag: Ast.Node.Tag) bool {
 }
 
 fn identifierToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
-    // If there is no bytes left, we render the identifier `a`
-    // Otherwise, if the first byte is not a valid identifier character,
-    // we output an escaped identifier from s.stringLiteral().
-    // Otherwise, we output the bytes up to the first non-identifier
-    // character. If that is not a valid identifier, we escape it.
+    const len, const data_len = for (0.., s.in) |i, c| switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '_' => {},
+        else => break .{ i, i + 1 },
+    } else .{ s.in.len, s.in.len };
 
     const token = try s.addToken(fba, .identifier);
-    if (s.in.len == 0) {
-        try s.ensureUnusedSourceCapacity(fba, 2);
-        s.source.appendSliceAssumeCapacity("a ");
+    if (len == 0) {
+        // Ignore this byte to allow for escaped identifiers
+        // starting with regular identifier charcters.
+        s.in = s.in[data_len..];
+        try s.ensureUnusedSourceCapacity(fba, 1);
+        s.source.appendAssumeCapacity('@');
+        try s.string(fba, '"');
     } else {
-        const len, const data_len = for (0.., s.in) |i, c| {
-            if (!isIdentifierCharacter(c)) break .{ i, i + 1 };
-        } else .{ s.in.len, s.in.len };
-
-        if (len == 0) {
-            // Ignore this byte to allow for escaped identifiers
-            // starting with regular identifier charcters.
-            s.in = s.in[1..];
-            try s.ensureUnusedSourceCapacity(fba, 1);
-            s.source.appendAssumeCapacity('@');
-            try s.stringLiteral(fba, '"');
-        } else {
-            try s.ensureUnusedSourceCapacity(fba, len + 4);
-            // If the identifier is a invalid or is a primitive then output an escaped identifier
-            const id = s.in[0..len];
-            const escape = !zig.isValidId(id) or zig.primitives.isPrimitive(id);
-            if (escape) s.source.appendSliceAssumeCapacity("@\"");
-            s.source.appendSliceAssumeCapacity(s.in[0..len]);
-            if (escape) s.source.appendAssumeCapacity('"');
-            s.source.appendAssumeCapacity(' ');
-            s.in = s.in[data_len..];
-        }
+        try s.ensureUnusedSourceCapacity(fba, len + 4);
+        // If the identifier is a invalid or is a primitive then output an escaped identifier
+        const id = s.in[0..len];
+        const escape = !zig.isValidId(id) or zig.primitives.isPrimitive(id);
+        if (escape) s.source.appendSliceAssumeCapacity("@\"");
+        s.source.appendSliceAssumeCapacity(s.in[0..len]);
+        if (escape) s.source.appendAssumeCapacity('"');
+        s.source.appendAssumeCapacity(' ');
+        s.in = s.in[data_len..];
     }
     return token;
 }
@@ -570,7 +625,7 @@ fn endContainer(
         nodes_slice.items(.data)[@intFromEnum(item.node)] =
             .{ .extra_range = try members.toSpan(fba, &s.extra_data) };
     } else {
-        nodes_slice.items(.tag)[@intFromEnum(item.node)] = if (trailing) two else two_trailing;
+        nodes_slice.items(.tag)[@intFromEnum(item.node)] = if (!trailing) two else two_trailing;
         nodes_slice.items(.data)[@intFromEnum(item.node)] =
             .{ .opt_node_and_opt_node = members.toTwo() };
     }
@@ -598,13 +653,14 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
     if (container.emit_open_end) {
         switch (tag) {
             .container_decl_arg => {
-                _ = try s.outputToken(fba, .r_paren);
-                _ = try s.outputToken(fba, .l_brace);
+                _ = try s.outputTokens(fba, &.{ .r_paren, .l_brace });
             },
             .tagged_union_enum_tag => {
-                _ = try s.outputToken(fba, .r_paren);
-                _ = try s.outputToken(fba, .r_paren);
-                _ = try s.outputToken(fba, .l_brace);
+                _ = try s.outputTokens(fba, &.{
+                    .r_paren,
+                    .r_paren,
+                    .l_brace,
+                });
             },
             else => unreachable,
         }
@@ -673,6 +729,7 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
 
     switch (member.kind) {
         .field => if (container.fields_allowed) {
+            // IMPORTANT: enums will need special handling
             container.last_is_field = true;
             return tag;
         },
@@ -876,19 +933,19 @@ fn startExpression(
     while (true) {
         const other_expressions = [_]Ast.Node.Tag{
             // Identifier must come first since it is the default
-            .identifier,         .char_literal,          .string_literal, .multiline_string_literal,
-            .number_literal,     .enum_literal,          .error_value,    .unreachable_literal,
-            .array_init,         .array_init_dot,        .struct_init,    .struct_init_dot,
-            .@"resume",          .@"break",              .@"continue",    .@"return",
-            .block,              .@"asm",                .@"if",          .@"for",
-            .@"switch",          .while_cont,            .async_call,     .call,
-            .builtin_call,       .array_type,            .ptr_type,       .optional_type,
-            .error_set_decl,     .error_union,           .container_decl, .container_decl_arg,
-            .tagged_union,       .tagged_union_enum_tag, .array_access,   .slice,
-            .slice_open,         .slice_sentinel,        .deref,          .unwrap_optional,
-            .grouped_expression, .field_access,
+            .identifier,            .char_literal,   .string_literal,     .multiline_string_literal,
+            .number_literal,        .enum_literal,   .error_value,        .unreachable_literal,
+            .array_init,            .array_init_dot, .struct_init,        .struct_init_dot,
+            .@"resume",             .@"break",       .@"continue",        .block,
+            .@"asm",                .@"if",          .@"for",             .@"switch",
+            .while_cont,            .async_call,     .call,               .builtin_call,
+            .array_type,            .ptr_type,       .optional_type,      .error_set_decl,
+            .error_union,           .container_decl, .container_decl_arg, .tagged_union,
+            .tagged_union_enum_tag, .array_access,   .slice,              .slice_open,
+            .slice_sentinel,        .deref,          .unwrap_optional,    .grouped_expression,
+            .field_access,
         };
-        // These expressions start with an expression and have data as node_and_node
+        // These expressions start with an expression and have data as `node_and_node`
         const simple_binary_expressions = [_]Ast.Node.Tag{
             .add,          .add_sat,          .add_wrap,    .array_cat,  .sub,
             .sub_sat,      .sub_wrap,         .mul,         .mul_sat,    .mul_wrap,
@@ -897,10 +954,10 @@ fn startExpression(
             .bool_or,      .merge_error_sets, .equal_equal, .bang_equal, .greater_or_equal,
             .greater_than, .less_or_equal,    .less_than,   .@"catch",   .@"orelse",
         };
-        // These expressions start by emitting their main_token and have data as node
+        // These expressions start by emitting their main_token and have data as `node`
         const simple_unary_expressions = [_]Ast.Node.Tag{
-            .negation,     .negation_wrap, .bit_not, .bool_not,   .@"await",
-            .@"nosuspend", .@"comptime",   .@"try",  .address_of,
+            .negation, .negation_wrap, .bit_not,     .bool_not, .address_of,
+            .@"await", .@"nosuspend",  .@"comptime", .@"try",
         };
         // zig fmt: off
         const start_other = 0;
@@ -949,11 +1006,11 @@ fn startExpression(
                     .negation_wrap => .minus_percent,
                     .bit_not => .tilde,
                     .bool_not => .bang,
+                    .address_of => .ampersand,
                     .@"await" => .keyword_await,
                     .@"nosuspend" => .keyword_nosuspend,
                     .@"comptime" => .keyword_comptime,
                     .@"try" => .keyword_try,
-                    .address_of => .ampersand,
                     else => unreachable,
                 });
                 s.nodes.set(@intFromEnum(expr_node), .{
@@ -965,44 +1022,157 @@ fn startExpression(
             },
             start_other...(start_simple_binary - 1) => |i| {
                 switch (other_expressions[i - start_other]) {
-                    .identifier => {
-                        s.nodes.set(@intFromEnum(expr_node), .{
-                            .tag = .identifier,
-                            .main_token = try s.identifierToken(fba),
-                            .data = undefined,
-                        });
-                        break;
-                    },
-                    .char_literal => {
-                        s.nodes.set(@intFromEnum(expr_node), .{
-                            .tag = .char_literal,
-                            .main_token = try s.charLiteralToken(fba),
-                            .data = undefined,
-                        });
-                        break;
-                    },
-                    .string_literal => {
-                        s.nodes.set(@intFromEnum(expr_node), .{
-                            .tag = .string_literal,
-                            .main_token = try s.stringLiteralToken(fba),
-                            .data = undefined,
-                        });
-                        break;
-                    },
-                    .multiline_string_literal,
+                    .identifier,
+                    .char_literal,
+                    .string_literal,
                     .number_literal,
+                    .unreachable_literal,
                     .enum_literal,
                     .error_value,
-                    .unreachable_literal,
+                    => |tag| {
+                        const main_token: Ast.TokenIndex = switch (tag) {
+                            .identifier => try s.identifierToken(fba),
+                            .char_literal => tok: {
+                                const token = try s.addToken(fba, .char_literal);
+                                try s.string(fba, '\'');
+                                break :tok token;
+                            },
+                            .string_literal => try s.stringLiteralToken(fba),
+                            .number_literal => try s.numberLiteralToken(fba),
+                            .unreachable_literal => try s.outputToken(fba, .keyword_unreachable),
+                            .enum_literal => tok: {
+                                _ = try s.outputToken(fba, .period);
+                                break :tok try s.identifierToken(fba);
+                            },
+                            .error_value => tok: {
+                                const token = try s.outputTokens(fba, &.{
+                                    .keyword_error,
+                                    .period,
+                                });
+                                _ = try s.identifierToken(fba);
+                                break :tok token;
+                            },
+                            else => unreachable,
+                        };
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = main_token,
+                            .data = undefined,
+                        });
+                        break;
+                    },
+                    .multiline_string_literal => {
+                        const tokens = try s.multilineStringLiteralTokens(fba);
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = .multiline_string_literal,
+                            .main_token = tokens[0],
+                            .data = .{ .token_and_token = tokens },
+                        });
+                        break;
+                    },
+                    .container_decl,
+                    .container_decl_arg,
+                    .tagged_union,
+                    .tagged_union_enum_tag,
+                    => |tag| {
+                        const info: packed struct {
+                            kind: enum(u2) {
+                                @"struct",
+                                @"union",
+                                @"opaque",
+                                @"enum",
+                            },
+                            qualifier: enum(u2) {
+                                @"packed",
+                                @"extern",
+                                _,
+                            },
+                        } = @bitCast(@as(u4, @truncate(s.consumeByte() orelse 0)));
+                        switch (info.qualifier) {
+                            .@"packed" => _ = try s.outputToken(fba, .keyword_packed),
+                            .@"extern" => _ = try s.outputToken(fba, .keyword_extern),
+                            _ => {},
+                        }
+
+                        const main_token, const has_arg = switch (tag) {
+                            .container_decl => .{
+                                try s.outputTokens(fba, &.{
+                                    switch (info.kind) {
+                                        .@"struct" => .keyword_struct,
+                                        .@"union" => .keyword_union,
+                                        .@"opaque" => .keyword_opaque,
+                                        .@"enum" => .keyword_enum,
+                                    },
+                                    .l_brace,
+                                }),
+                                false,
+                            },
+                            .container_decl_arg => .{
+                                try s.outputTokens(fba, &.{
+                                    // Opaque cannot have an arguments and
+                                    // union has special cases for tags.
+                                    switch (info.kind) {
+                                        .@"struct", .@"opaque" => .keyword_struct,
+                                        .@"enum", .@"union" => .keyword_enum,
+                                    },
+                                    .l_paren,
+                                }),
+                                true,
+                            },
+                            .tagged_union => .{
+                                try s.outputTokens(fba, &.{
+                                    .keyword_union,
+                                    .l_paren,
+                                    .keyword_enum,
+                                    .r_paren,
+                                    .l_brace,
+                                }),
+                                false,
+                            },
+                            .tagged_union_enum_tag => .{
+                                try s.outputTokens(fba, &.{
+                                    .keyword_union,
+                                    .l_paren,
+                                    .keyword_enum,
+                                    .l_paren,
+                                }),
+                                true,
+                            },
+                            else => unreachable,
+                        };
+                        const tag_expr = if (has_arg) try s.reserveNode(fba) else undefined;
+
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = main_token,
+                            .data = if (has_arg)
+                                .{ .node_and_extra = .{ tag_expr, undefined } }
+                            else
+                                .{ .extra_range = undefined },
+                        });
+                        try s.stack.append(.{
+                            .node = expr_node,
+                            .data = .{ .container = if (has_arg) .empty_tagged else .empty },
+                        });
+
+                        if (has_arg) {
+                            expr_node = tag_expr;
+                            parent_is_type = false;
+                            parent_precedence = std.math.maxInt(u8);
+                            parent_is_compare = false;
+                        } else {
+                            break;
+                        }
+                    },
                     .array_init,
                     .array_init_dot,
                     .struct_init,
                     .struct_init_dot,
+                    .block,
                     .@"resume",
                     .@"break",
                     .@"continue",
                     .@"return",
-                    .block,
                     .@"asm",
                     .@"if",
                     .@"for",
@@ -1020,10 +1190,6 @@ fn startExpression(
                     .slice,
                     .slice_open,
                     .slice_sentinel,
-                    .container_decl,
-                    .container_decl_arg,
-                    .tagged_union,
-                    .tagged_union_enum_tag,
                     => {
                         s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .identifier,
