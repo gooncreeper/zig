@@ -18,10 +18,10 @@ extra_data: std.ArrayListUnmanaged(u32),
 /// avoid unnecessary stack overflows when parsing the AST.
 stack: std.BoundedArray(StackItem, 32) = .{},
 
-const TopStackTag = Ast.Node.Tag;
 const StackItem = struct {
     node: Ast.Node.Index,
     data: union {
+        members: Members,
         container: Container,
         var_decl: VarDecl,
     },
@@ -60,51 +60,43 @@ const StackItem = struct {
         emit_r_paren: bool,
         emit_semicolon: bool,
 
-        pub fn init(in: ?u8, initialize: bool) VarDecl {
-            const emits: packed struct {
-                type: bool,
-                @"align": bool,
-                @"addrspace": bool,
-                @"linksection": bool,
-            } = @bitCast(@as(u4, @truncate(in orelse 0)));
-            return .{
-                .emit_type = emits.type,
-                .emit_align = emits.@"align",
-                .emit_addrspace = emits.@"addrspace",
-                .emit_linksection = emits.@"linksection",
-                .emit_initialization = initialize,
-                .emit_r_paren = false,
-                .emit_semicolon = false,
-            };
-        }
-
         /// Outputs `(KEYWORD_const / KEYWORD_var) IDENTIFIER`
         /// Returns a node wich will store the rest of the emitted variable data
-        pub fn start(self: VarDecl, s: *Smith, fba: Allocator, mut: bool) Error!Ast.Node.Index {
+        pub fn start(s: *Smith, fba: Allocator, mut: bool, initialize: bool) Error!struct {
+            VarDecl,
+            Ast.Node.Index,
+        } {
+            const emits = s.consumePacked(packed struct {
+                type: bool = false,
+                @"align": bool = false,
+                @"addrspace": bool = false,
+                @"linksection": bool = false,
+            }, .{});
+
             const mut_tag: Token.Tag = if (mut) .keyword_var else .keyword_const;
             const mut_token = try s.outputToken(fba, mut_tag);
             _ = try s.identifierToken(fba);
 
             const tag: Ast.Node.Tag, const data: Ast.Node.Data =
-                if (self.emit_addrspace or self.emit_linksection)
+                if (emits.@"addrspace" or emits.@"linksection")
                     .{ .global_var_decl, .{ .extra_and_opt_node = .{
                         try s.addExtra(fba, Ast.Node.GlobalVarDecl, .{
-                            .type_node = if (self.emit_type) undefined else .none,
-                            .align_node = if (self.emit_align) undefined else .none,
-                            .addrspace_node = if (self.emit_addrspace) undefined else .none,
-                            .section_node = if (self.emit_linksection) undefined else .none,
+                            .type_node = if (emits.type) undefined else .none,
+                            .align_node = if (emits.@"align") undefined else .none,
+                            .addrspace_node = if (emits.@"addrspace") undefined else .none,
+                            .section_node = if (emits.@"linksection") undefined else .none,
                         }),
-                        if (self.emit_initialization) undefined else .none,
+                        if (initialize) undefined else .none,
                     } } }
-                else if (!self.emit_align)
+                else if (!emits.@"align")
                     .{ .simple_var_decl, .{ .opt_node_and_opt_node = .{
-                        if (self.emit_type) undefined else .none,
-                        if (self.emit_initialization) undefined else .none,
+                        if (emits.type) undefined else .none,
+                        if (initialize) undefined else .none,
                     } } }
-                else if (!self.emit_type)
+                else if (!emits.type)
                     .{ .aligned_var_decl, .{ .node_and_opt_node = .{
                         undefined,
-                        if (self.emit_initialization) undefined else .none,
+                        if (initialize) undefined else .none,
                     } } }
                 else
                     .{ .local_var_decl, .{ .extra_and_opt_node = .{
@@ -112,9 +104,21 @@ const StackItem = struct {
                             .type_node = undefined,
                             .align_node = undefined,
                         }),
-                        if (self.emit_initialization) undefined else .none,
+                        if (initialize) undefined else .none,
                     } } };
-            return s.addNode(fba, tag, mut_token, data);
+
+            return .{
+                .{
+                    .emit_type = emits.type,
+                    .emit_align = emits.@"align",
+                    .emit_addrspace = emits.@"addrspace",
+                    .emit_linksection = emits.@"linksection",
+                    .emit_initialization = initialize,
+                    .emit_r_paren = false,
+                    .emit_semicolon = false,
+                },
+                try s.addNode(fba, tag, mut_token, data),
+            };
         }
     };
 };
@@ -132,18 +136,27 @@ const Members = struct {
 
     pub fn toSpan(
         self: @This(),
+        s: *Smith,
         fba: Allocator,
-        extra_data: *std.ArrayListUnmanaged(u32),
-    ) Allocator.Error!Ast.Node.SubRange {
-        const start = extra_data.items.len;
+    ) Error!Ast.Node.SubRange {
+        const start = s.extra_data.items.len;
         const len = self.indexes.constSlice().len;
-        for (try extra_data.addManyAsSlice(fba, len), self.indexes.constSlice()) |*e, m| {
+        for (try s.extra_data.addManyAsSlice(fba, len), self.indexes.constSlice()) |*e, m| {
             e.* = @intFromEnum(m);
         }
         return .{
             .start = @enumFromInt(start),
-            .end = @enumFromInt(extra_data.items.len),
+            .end = @enumFromInt(s.extra_data.items.len),
         };
+    }
+
+    pub fn toExtraSpan(
+        self: @This(),
+        s: *Smith,
+        fba: Allocator,
+    ) Error!Ast.ExtraIndex {
+        const span = try self.toSpan(s, fba);
+        return s.addExtra(fba, Ast.Node.SubRange, span);
     }
 };
 
@@ -186,21 +199,23 @@ pub fn generate(fba: Allocator, bytes: []const u8) Error!Ast {
 }
 
 fn consumeStack(s: *Smith, fba: Allocator) Error!void {
-    sw: switch (Ast.Node.Tag.root) {
-        .root => if (try s.containerMember(fba, .root)) |t| continue :sw t,
+    while (s.stack.len != 0) switch (s.topStackTag()) {
+        .root,
         .container_decl,
         .container_decl_arg,
         .tagged_union,
         .tagged_union_enum_tag,
-        => |tag| continue :sw (try s.containerMember(fba, tag)).?,
+        => |tag| try s.containerMember(fba, tag),
         .global_var_decl,
         .local_var_decl,
         .simple_var_decl,
         .aligned_var_decl,
-        => |tag| {
-            try s.varDecl(fba, tag);
-            continue :sw s.topStackTag();
-        },
+        => |tag| try s.varDecl(fba, tag),
+        .array_init,
+        .array_init_dot,
+        .struct_init,
+        .struct_init_dot,
+        => |tag| try s.initListMember(fba, tag),
         .add,
         .add_sat,
         .add_wrap,
@@ -270,13 +285,11 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
             const slice = s.nodes.slice();
             slice.items(.main_token)[@intFromEnum(item.node)] = main_token;
             slice.items(.data)[@intFromEnum(item.node)].node_and_node[1] = rhs;
-            continue :sw s.topStackTag();
         },
         .deref => {
             const item = s.stack.pop().?;
             const main_token = try s.outputToken(fba, .period_asterisk);
             s.nodes.items(.main_token)[@intFromEnum(item.node)] = main_token;
-            continue :sw s.topStackTag();
         },
         .field_access, .unwrap_optional => |tag| {
             const item = s.stack.pop().?;
@@ -289,16 +302,14 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
             const slice = s.nodes.slice();
             slice.items(.main_token)[@intFromEnum(item.node)] = period_token;
             slice.items(.data)[@intFromEnum(item.node)].node_and_token[1] = second_token;
-            continue :sw s.topStackTag();
         },
         .grouped_expression => {
             const item = s.stack.pop().?;
             const r_paren_token = try s.outputToken(fba, .r_paren);
             s.nodes.items(.data)[@intFromEnum(item.node)].node_and_token[1] = r_paren_token;
-            continue :sw s.topStackTag();
         },
         else => |tag| std.debug.panic("unexpected tag: {} ({s})", .{ @intFromEnum(tag), @tagName(tag) }),
-    }
+    };
 }
 
 fn reserveNode(s: *Smith, fba: std.mem.Allocator) Error!Ast.Node.Index {
@@ -355,7 +366,7 @@ fn ensureUnusedSourceCapacity(s: *Smith, fba: std.mem.Allocator, n: usize) Error
     if (s.source.items.len == std.math.maxInt(u32)) return error.Overflow;
 }
 
-fn topStackTag(s: *Smith) TopStackTag {
+fn topStackTag(s: *Smith) Ast.Node.Tag {
     return s.nodes.items(.tag)[@intFromEnum(s.stack.constSlice()[s.stack.len - 1].node)];
 }
 
@@ -364,6 +375,14 @@ fn consumeByte(s: *Smith) ?u8 {
     const b = s.in[0];
     s.in = s.in[1..];
     return b;
+}
+
+/// Assumes T's backing integer is at most 8 bits
+fn consumePacked(s: *Smith, T: type, default: T) T {
+    return if (s.consumeByte()) |b|
+        @bitCast(@as(@typeInfo(T).@"struct".backing_integer.?, @truncate(b)))
+    else
+        default;
 }
 
 fn addToken(s: *Smith, fba: std.mem.Allocator, tag: Token.Tag) Error!Ast.TokenIndex {
@@ -515,7 +534,6 @@ fn opTagPrecedence(tag: Ast.Node.Tag) u8 {
         .error_union,
         => 3,
         .array_init,
-        .array_init_dot,
         .struct_init,
         => 4,
         .negation,
@@ -608,28 +626,29 @@ fn identifierToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
     return token;
 }
 
-fn endContainer(
+fn endCurlyMembers(
     s: *Smith,
     fba: Allocator,
+    item: StackItem,
+    members: Members,
+    many: Ast.Node.Tag,
     many_trailing: Ast.Node.Tag,
     two: Ast.Node.Tag,
     two_trailing: Ast.Node.Tag,
 ) Error!void {
-    const item = s.stack.constSlice()[s.stack.len - 1];
-    const members = item.data.container.members;
     const nodes_slice = s.nodes.slice();
-
     const trailing = s.tokens.items(.tag)[s.tokens.len - 1] == .comma;
     if (members.indexes.len > 2) {
-        if (trailing) nodes_slice.items(.tag)[@intFromEnum(item.node)] = many_trailing;
-        nodes_slice.items(.data)[@intFromEnum(item.node)] =
-            .{ .extra_range = try members.toSpan(fba, &s.extra_data) };
+        nodes_slice.items(.tag)[@intFromEnum(item.node)] = if (!trailing) many else many_trailing;
+        nodes_slice.items(.data)[@intFromEnum(item.node)] = .{
+            .extra_range = try members.toSpan(s, fba),
+        };
     } else {
         nodes_slice.items(.tag)[@intFromEnum(item.node)] = if (!trailing) two else two_trailing;
-        nodes_slice.items(.data)[@intFromEnum(item.node)] =
-            .{ .opt_node_and_opt_node = members.toTwo() };
+        nodes_slice.items(.data)[@intFromEnum(item.node)] = .{
+            .opt_node_and_opt_node = members.toTwo(),
+        };
     }
-    _ = try s.outputToken(fba, .r_brace);
 }
 
 fn endTaggedContainer(s: *Smith, fba: Allocator, trailing_tag: Ast.Node.Tag) Error!void {
@@ -640,14 +659,11 @@ fn endTaggedContainer(s: *Smith, fba: Allocator, trailing_tag: Ast.Node.Tag) Err
         nodes_slice.items(.tag)[@intFromEnum(item.node)] = trailing_tag;
     }
 
-    const member_span = try item.data.container.members.toSpan(fba, &s.extra_data);
-    const sub_range = try s.addExtra(fba, Ast.Node.SubRange, member_span);
+    const sub_range = try item.data.container.members.toExtraSpan(s, fba);
     nodes_slice.items(.data)[@intFromEnum(item.node)].node_and_extra[1] = sub_range;
-    _ = try s.outputToken(fba, .r_brace);
 }
 
-/// Iff the stack is empty, returns null
-fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStackTag {
+fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     const item = &s.stack.slice()[s.stack.len - 1];
     const container = &item.data.container;
     if (container.emit_open_end) {
@@ -667,7 +683,7 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
         container.emit_open_end = false;
     }
 
-    const MemberData = packed struct(u8) {
+    const member = s.consumePacked(packed struct(u8) {
         kind: enum(u4) {
             field,
             const_global_var,
@@ -681,7 +697,7 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
             @"test",
             @"comptime",
             @"usingnamespace",
-            // end
+            /// end
             _,
         },
         data: packed union {
@@ -716,11 +732,10 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
                 @"pub": bool,
             },
         },
-    };
-    const member: MemberData = @bitCast(s.consumeByte() orelse @as(u8, @bitCast(MemberData{
+    }, .{
         .kind = @enumFromInt(15), // end
         .data = undefined,
-    })));
+    });
 
     if (member.kind != .field and container.last_is_field) {
         container.fields_allowed = false;
@@ -731,7 +746,7 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
         .field => if (container.fields_allowed) {
             // IMPORTANT: enums will need special handling
             container.last_is_field = true;
-            return tag;
+            return;
         },
         .const_global_var, .mut_global_var => {
             const qualifiers = member.data.global_var;
@@ -747,11 +762,15 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
             }
             if (qualifiers.@"threadlocal") _ = try s.outputToken(fba, .keyword_threadlocal);
 
-            const var_decl: StackItem.VarDecl = .init(s.consumeByte(), true);
-            const node = try var_decl.start(s, fba, member.kind == .mut_global_var);
+            const var_decl, const node = try StackItem.VarDecl.start(
+                s,
+                fba,
+                member.kind == .mut_global_var,
+                true,
+            );
             try container.members.indexes.append(node);
             try s.stack.append(.{ .node = node, .data = .{ .var_decl = var_decl } });
-            return s.nodes.items(.tag)[@intFromEnum(node)];
+            return;
         },
         .@"fn",
         .export_fn,
@@ -763,29 +782,30 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
         .@"comptime",
         .@"usingnamespace",
         => {
-            return tag;
+            return;
         },
         _ => {},
     }
 
     // End of container
     switch (tag) {
-        .root => {
-            s.nodes.items(.data)[@intFromEnum(item.node)] = .{
-                .extra_range = try container.members.toSpan(fba, &s.extra_data),
-            };
-            item.* = undefined;
-            s.stack.len -= 1;
-            return null;
+        .root => s.nodes.items(.data)[@intFromEnum(item.node)] = .{
+            .extra_range = try container.members.toSpan(s, fba),
         },
-        .container_decl => try s.endContainer(
+        .container_decl => try s.endCurlyMembers(
             fba,
+            item.*,
+            container.members,
+            .container_decl,
             .container_decl_trailing,
             .container_decl_two,
             .container_decl_two_trailing,
         ),
-        .tagged_union => try s.endContainer(
+        .tagged_union => try s.endCurlyMembers(
             fba,
+            item.*,
+            container.members,
+            .tagged_union,
             .tagged_union_trailing,
             .tagged_union_two,
             .tagged_union_two_trailing,
@@ -800,9 +820,101 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!?TopStack
         ),
         else => unreachable,
     }
+    if (tag != .root) _ = try s.outputToken(fba, .r_brace);
+
     item.* = undefined;
     s.stack.len -= 1;
-    return s.topStackTag();
+}
+
+fn initListMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
+    const item = &s.stack.slice()[s.stack.len - 1];
+    const members = &item.data.members;
+    const nodes_slice = s.nodes.slice();
+
+    if (members.indexes.len == 0) {
+        nodes_slice.items(.main_token)[@intFromEnum(item.node)] = try s.outputToken(fba, .l_brace);
+    }
+
+    const ending = s.consumePacked(packed struct {
+        end: bool,
+        comma: bool,
+    }, .{ .end = true, .comma = false });
+
+    if (ending.end and switch (tag) {
+        .array_init, .array_init_dot => members.indexes.len != 0,
+        .struct_init, .struct_init_dot => true,
+        else => unreachable,
+    }) {
+        const trailing = members.indexes.len != 0 and ending.comma;
+        if (trailing) _ = try s.outputToken(fba, .comma);
+
+        const tag_ptr = &nodes_slice.items(.tag)[@intFromEnum(item.node)];
+        const data_ptr = &nodes_slice.items(.data)[@intFromEnum(item.node)];
+        switch (tag) {
+            .array_init => if (members.indexes.len <= 1) {
+                tag_ptr.* = if (!trailing) .array_init_one else .array_init_one_comma;
+                data_ptr.* = .{ .node_and_node = .{
+                    data_ptr.node_and_extra[0],
+                    members.indexes.constSlice()[0],
+                } };
+            } else {
+                tag_ptr.* = if (!trailing) .array_init else .array_init_comma;
+                data_ptr.node_and_extra[1] = try members.toExtraSpan(s, fba);
+            },
+            .struct_init => if (members.indexes.len <= 1) {
+                tag_ptr.* = if (!trailing) .struct_init_one else .struct_init_one_comma;
+                data_ptr.* = .{ .node_and_opt_node = .{
+                    data_ptr.node_and_extra[0],
+                    if (members.indexes.len == 1)
+                        members.indexes.constSlice()[0].toOptional()
+                    else
+                        .none,
+                } };
+            } else {
+                tag_ptr.* = if (!trailing) .struct_init else .struct_init_comma;
+                data_ptr.node_and_extra[1] = try members.toExtraSpan(s, fba);
+            },
+            .array_init_dot => try s.endCurlyMembers(
+                fba,
+                item.*,
+                members.*,
+                .array_init_dot,
+                .array_init_dot_comma,
+                .array_init_dot_two,
+                .array_init_dot_two_comma,
+            ),
+            .struct_init_dot => try s.endCurlyMembers(
+                fba,
+                item.*,
+                members.*,
+                .struct_init_dot,
+                .struct_init_dot_comma,
+                .struct_init_dot_two,
+                .struct_init_dot_two_comma,
+            ),
+            else => unreachable,
+        }
+        _ = try s.outputToken(fba, .r_brace);
+
+        item.* = undefined;
+        s.stack.len -= 1;
+        return;
+    }
+
+    if (members.indexes.len != 0) {
+        _ = try s.outputToken(fba, .comma);
+    }
+    switch (tag) {
+        .struct_init, .struct_init_dot => {
+            _ = try s.outputToken(fba, .period);
+            _ = try s.identifierToken(fba);
+            _ = try s.outputToken(fba, .equal);
+        },
+        .array_init, .array_init_dot => {},
+        else => unreachable,
+    }
+    const expr = try s.startExpression(fba, null, false);
+    try members.indexes.append(expr);
 }
 
 fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
@@ -1164,10 +1276,40 @@ fn startExpression(
                             break;
                         }
                     },
-                    .array_init,
-                    .array_init_dot,
-                    .struct_init,
-                    .struct_init_dot,
+                    .array_init, .struct_init => |tag| {
+                        const precedence = opTagPrecedence(tag);
+                        if (parent_is_type or precedence > parent_precedence) {
+                            expr_node = try s.groupedExpression(fba, expr_node);
+                        }
+                        parent_is_type = true;
+                        parent_precedence = precedence;
+                        parent_is_compare = false;
+
+                        const typeexpr = try s.reserveNode(fba);
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = undefined,
+                            .data = .{ .node_and_extra = .{ typeexpr, undefined } },
+                        });
+                        try s.stack.append(.{
+                            .node = expr_node,
+                            .data = .{ .members = .{} },
+                        });
+                        expr_node = typeexpr;
+                    },
+                    .array_init_dot, .struct_init_dot => |tag| {
+                        _ = try s.outputToken(fba, .period);
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = undefined,
+                            .data = undefined,
+                        });
+                        try s.stack.append(.{
+                            .node = expr_node,
+                            .data = .{ .members = .{} },
+                        });
+                        break;
+                    },
                     .block,
                     .@"resume",
                     .@"break",
