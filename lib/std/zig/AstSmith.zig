@@ -24,6 +24,7 @@ const StackItem = struct {
         members: Members,
         container: Container,
         var_decl: VarDecl,
+        slice: Slice,
     },
 
     const Container = struct {
@@ -121,6 +122,13 @@ const StackItem = struct {
             };
         }
     };
+
+    const Slice = struct {
+        start: bool,
+        dots: bool,
+        end: bool,
+        sentinel: bool,
+    };
 };
 
 const Members = struct {
@@ -210,12 +218,16 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
         .local_var_decl,
         .simple_var_decl,
         .aligned_var_decl,
-        => |tag| try s.varDecl(fba, tag),
+        => |tag| try s.varDeclPart(fba, tag),
         .array_init,
         .array_init_dot,
         .struct_init,
         .struct_init_dot,
         => |tag| try s.initListMember(fba, tag),
+        .slice,
+        .slice_open,
+        .slice_sentinel,
+        => |tag| try s.slicePart(fba, tag),
         .add,
         .add_sat,
         .add_wrap,
@@ -917,7 +929,7 @@ fn initListMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     try members.indexes.append(expr);
 }
 
-fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
+fn varDeclPart(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     const item = &s.stack.slice()[s.stack.len - 1];
     const var_decl = &item.data.var_decl;
 
@@ -1028,6 +1040,63 @@ fn varDecl(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     s.stack.len -= 1;
 }
 
+fn slicePart(s: *Smith, fba: std.mem.Allocator, tag: Ast.Node.Tag) Error!void {
+    const item = &s.stack.slice()[s.stack.len - 1];
+    const slice = &item.data.slice;
+
+    if (slice.start) {
+        slice.start = false;
+        s.nodes.items(.main_token)[@intFromEnum(item.node)] = try s.outputToken(fba, .l_bracket);
+        const expr = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
+        switch (tag) {
+            .slice_open => data.node_and_node[1] = expr,
+            .slice => s.extraField(Ast.Node.Slice, .start, data.node_and_extra[1]).* = expr,
+            .slice_sentinel => {
+                const field = s.extraField(Ast.Node.SliceSentinel, .start, data.node_and_extra[1]);
+                field.* = expr;
+            },
+            else => unreachable,
+        }
+        return;
+    }
+
+    if (slice.dots) {
+        slice.dots = false;
+        _ = try s.outputToken(fba, .ellipsis2);
+    }
+
+    if (slice.end) {
+        slice.end = false;
+        const expr = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
+        switch (tag) {
+            .slice => s.extraField(Ast.Node.Slice, .end, data.node_and_extra[1]).* = expr,
+            .slice_sentinel => {
+                const field = s.extraField(Ast.Node.SliceSentinel, .end, data.node_and_extra[1]);
+                field.* = expr.toOptional();
+            },
+            else => unreachable,
+        }
+        return;
+    }
+
+    if (slice.sentinel) {
+        assert(tag == .slice_sentinel);
+        slice.sentinel = false;
+        _ = try s.outputToken(fba, .colon);
+
+        const expr = try s.startExpression(fba, null, false);
+        const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
+        s.extraField(Ast.Node.SliceSentinel, .sentinel, data.node_and_extra[1]).* = expr;
+        return;
+    }
+
+    _ = try s.outputToken(fba, .r_bracket);
+    item.* = undefined;
+    s.stack.len -= 1;
+}
+
 fn startExpression(
     s: *Smith,
     fba: Allocator,
@@ -1035,7 +1104,7 @@ fn startExpression(
     base_is_type: bool,
 ) Error!Ast.Node.Index {
     const main_node = try s.reserveNode(fba);
-    var parent_is_type = base_is_type;
+    var is_type_expr = base_is_type;
     var parent_precedence, var parent_is_compare = if (base_parent_tag) |p|
         .{ opTagPrecedence(p), isComparisonOpTag(p) }
     else
@@ -1045,17 +1114,16 @@ fn startExpression(
     while (true) {
         const other_expressions = [_]Ast.Node.Tag{
             // Identifier must come first since it is the default
-            .identifier,            .char_literal,   .string_literal,     .multiline_string_literal,
-            .number_literal,        .enum_literal,   .error_value,        .unreachable_literal,
-            .array_init,            .array_init_dot, .struct_init,        .struct_init_dot,
-            .@"resume",             .@"break",       .@"continue",        .block,
-            .@"asm",                .@"if",          .@"for",             .@"switch",
-            .while_cont,            .async_call,     .call,               .builtin_call,
-            .array_type,            .ptr_type,       .optional_type,      .error_set_decl,
-            .error_union,           .container_decl, .container_decl_arg, .tagged_union,
-            .tagged_union_enum_tag, .array_access,   .slice,              .slice_open,
-            .slice_sentinel,        .deref,          .unwrap_optional,    .grouped_expression,
-            .field_access,
+            .identifier,            .char_literal,       .string_literal,     .multiline_string_literal,
+            .number_literal,        .enum_literal,       .error_value,        .unreachable_literal,
+            .array_init,            .array_init_dot,     .struct_init,        .struct_init_dot,
+            .@"resume",             .@"break",           .@"continue",        .block,
+            .@"asm",                .@"if",              .@"for",             .@"switch",
+            .while_cont,            .async_call,         .call,               .builtin_call,
+            .array_type,            .ptr_type,           .optional_type,      .error_set_decl,
+            .error_union,           .container_decl,     .container_decl_arg, .tagged_union,
+            .tagged_union_enum_tag, .array_access,       .slice_sentinel,     .deref,
+            .unwrap_optional,       .grouped_expression, .field_access,
         };
         // These expressions start with an expression and have data as `node_and_node`
         const simple_binary_expressions = [_]Ast.Node.Tag{
@@ -1083,13 +1151,13 @@ fn startExpression(
                 const tag = simple_binary_expressions[i - start_simple_binary];
                 const precedence = opTagPrecedence(tag);
                 const is_compare = isComparisonOpTag(tag);
-                if (parent_is_type or
+                if (is_type_expr or
                     precedence > parent_precedence or
                     parent_is_compare and is_compare)
                 {
                     expr_node = try s.groupedExpression(fba, expr_node);
                 }
-                parent_is_type = false;
+                is_type_expr = false;
                 parent_precedence = precedence;
                 parent_is_compare = is_compare;
 
@@ -1105,10 +1173,10 @@ fn startExpression(
             start_simple_unary...(end_expressions - 1) => |i| {
                 const tag = simple_unary_expressions[i - start_simple_unary];
                 const precedence = opTagPrecedence(tag);
-                if (parent_is_type or precedence > parent_precedence) {
+                if (is_type_expr or precedence > parent_precedence) {
                     expr_node = try s.groupedExpression(fba, expr_node);
                 }
-                parent_is_type = false;
+                is_type_expr = false;
                 parent_precedence = precedence;
                 parent_is_compare = false;
 
@@ -1181,6 +1249,58 @@ fn startExpression(
                             .data = .{ .token_and_token = tokens },
                         });
                         break;
+                    },
+                    .slice_sentinel => {
+                        const precedence = comptime opTagPrecedence(.slice_sentinel);
+                        if (precedence > parent_precedence) {
+                            expr_node = try s.groupedExpression(fba, expr_node);
+                        }
+                        is_type_expr = true;
+                        parent_precedence = precedence;
+                        parent_is_compare = false;
+
+                        const parts = s.consumePacked(packed struct {
+                            end: bool,
+                            sentinel: bool,
+                        }, .{ .end = false, .sentinel = false });
+
+                        const lhs = try s.reserveNode(fba);
+                        const tag: Ast.Node.Tag, const data: Ast.Node.Data =
+                            if (!parts.end and !parts.sentinel)
+                                .{ .slice_open, .{ .node_and_node = .{
+                                    lhs,
+                                    undefined,
+                                } } }
+                            else if (!parts.sentinel)
+                                .{ .slice, .{ .node_and_extra = .{
+                                    lhs,
+                                    try s.addExtra(fba, Ast.Node.Slice, undefined),
+                                } } }
+                            else
+                                .{ .slice_sentinel, .{ .node_and_extra = .{
+                                    lhs,
+                                    try s.addExtra(fba, Ast.Node.SliceSentinel, .{
+                                        .start = undefined,
+                                        .end = if (parts.end) undefined else .none,
+                                        .sentinel = undefined,
+                                    }),
+                                } } };
+
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = undefined,
+                            .data = data,
+                        });
+                        try s.stack.append(.{
+                            .node = expr_node,
+                            .data = .{ .slice = .{
+                                .start = true,
+                                .dots = true,
+                                .end = parts.end,
+                                .sentinel = parts.sentinel,
+                            } },
+                        });
+                        expr_node = lhs;
                     },
                     .container_decl,
                     .container_decl_arg,
@@ -1269,7 +1389,7 @@ fn startExpression(
 
                         if (has_arg) {
                             expr_node = tag_expr;
-                            parent_is_type = false;
+                            is_type_expr = false;
                             parent_precedence = std.math.maxInt(u8);
                             parent_is_compare = false;
                         } else {
@@ -1278,10 +1398,10 @@ fn startExpression(
                     },
                     .array_init, .struct_init => |tag| {
                         const precedence = opTagPrecedence(tag);
-                        if (parent_is_type or precedence > parent_precedence) {
+                        if (is_type_expr or precedence > parent_precedence) {
                             expr_node = try s.groupedExpression(fba, expr_node);
                         }
-                        parent_is_type = true;
+                        is_type_expr = true;
                         parent_precedence = precedence;
                         parent_is_compare = false;
 
@@ -1329,9 +1449,6 @@ fn startExpression(
                     .error_set_decl,
                     .error_union,
                     .array_access,
-                    .slice,
-                    .slice_open,
-                    .slice_sentinel,
                     => {
                         s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .identifier,
@@ -1342,7 +1459,7 @@ fn startExpression(
                     },
                     .deref, .unwrap_optional, .field_access => |tag| {
                         const precedence = opTagPrecedence(tag);
-                        if ((tag != .field_access and parent_is_type) or
+                        if ((tag != .field_access and is_type_expr) or
                             precedence > parent_precedence)
                         {
                             expr_node = try s.groupedExpression(fba, expr_node);
@@ -1368,7 +1485,7 @@ fn startExpression(
                     },
                     .grouped_expression => {
                         expr_node = try s.groupedExpression(fba, expr_node);
-                        parent_is_type = false;
+                        is_type_expr = false;
                         parent_precedence = std.math.maxInt(u8);
                         parent_is_compare = false;
                     },
