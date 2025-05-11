@@ -24,7 +24,7 @@ const StackItem = struct {
         members: Members,
         container: Container,
         var_decl: VarDecl,
-        slice: Slice,
+        bracket_suffix: BracketSuffix,
     },
 
     const Container = struct {
@@ -123,10 +123,10 @@ const StackItem = struct {
         }
     };
 
-    const Slice = struct {
-        start: bool,
+    const BracketSuffix = struct {
+        index: bool,
         dots: bool,
-        end: bool,
+        end_index: bool,
         sentinel: bool,
     };
 };
@@ -227,10 +227,11 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
         .async_call,
         .builtin_call,
         => |tag| try s.listMember(fba, tag),
+        .array_access,
         .slice,
         .slice_open,
         .slice_sentinel,
-        => |tag| try s.slicePart(fba, tag),
+        => |tag| try s.bracketSuffixPart(fba, tag),
         .add,
         .add_sat,
         .add_wrap,
@@ -323,7 +324,7 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
             const r_paren_token = try s.outputToken(fba, .r_paren);
             s.nodes.items(.data)[@intFromEnum(item.node)].node_and_token[1] = r_paren_token;
         },
-        else => |tag| std.debug.panic("unexpected tag: {} ({s})", .{ @intFromEnum(tag), @tagName(tag) }),
+        else => unreachable,
     };
 }
 
@@ -1128,17 +1129,17 @@ fn varDeclPart(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     s.stack.len -= 1;
 }
 
-fn slicePart(s: *Smith, fba: std.mem.Allocator, tag: Ast.Node.Tag) Error!void {
+fn bracketSuffixPart(s: *Smith, fba: std.mem.Allocator, tag: Ast.Node.Tag) Error!void {
     const item = &s.stack.slice()[s.stack.len - 1];
-    const slice = &item.data.slice;
+    const suffix = &item.data.bracket_suffix;
 
-    if (slice.start) {
-        slice.start = false;
+    if (suffix.index) {
+        suffix.index = false;
         s.nodes.items(.main_token)[@intFromEnum(item.node)] = try s.outputToken(fba, .l_bracket);
         const expr = try s.startExpression(fba, null, false);
         const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
         switch (tag) {
-            .slice_open => data.node_and_node[1] = expr,
+            .array_access, .slice_open => data.node_and_node[1] = expr,
             .slice => s.extraField(Ast.Node.Slice, .start, data.node_and_extra[1]).* = expr,
             .slice_sentinel => {
                 const field = s.extraField(Ast.Node.SliceSentinel, .start, data.node_and_extra[1]);
@@ -1149,13 +1150,13 @@ fn slicePart(s: *Smith, fba: std.mem.Allocator, tag: Ast.Node.Tag) Error!void {
         return;
     }
 
-    if (slice.dots) {
-        slice.dots = false;
+    if (suffix.dots) {
+        suffix.dots = false;
         _ = try s.outputToken(fba, .ellipsis2);
     }
 
-    if (slice.end) {
-        slice.end = false;
+    if (suffix.end_index) {
+        suffix.end_index = false;
         const expr = try s.startExpression(fba, null, false);
         const data = &s.nodes.items(.data)[@intFromEnum(item.node)];
         switch (tag) {
@@ -1169,9 +1170,9 @@ fn slicePart(s: *Smith, fba: std.mem.Allocator, tag: Ast.Node.Tag) Error!void {
         return;
     }
 
-    if (slice.sentinel) {
+    if (suffix.sentinel) {
         assert(tag == .slice_sentinel);
-        slice.sentinel = false;
+        suffix.sentinel = false;
         _ = try s.outputToken(fba, .colon);
 
         const expr = try s.startExpression(fba, null, false);
@@ -1210,7 +1211,7 @@ fn startExpression(
             .while_cont,            .async_call,         .call,               .builtin_call,
             .array_type,            .ptr_type,           .optional_type,      .error_set_decl,
             .error_union,           .container_decl,     .container_decl_arg, .tagged_union,
-            .tagged_union_enum_tag, .array_access,       .slice_sentinel,     .deref,
+            .tagged_union_enum_tag, .array_access,       .slice_open,         .deref,
             .unwrap_optional,       .grouped_expression, .field_access,
         };
         // These expressions start with an expression and have data as `node_and_node`
@@ -1338,8 +1339,8 @@ fn startExpression(
                         });
                         break;
                     },
-                    .slice_sentinel => {
-                        const precedence = comptime opTagPrecedence(.slice_sentinel);
+                    .array_access, .slice_open => |tag| {
+                        const precedence = opTagPrecedence(tag);
                         if (precedence > parent_precedence) {
                             expr_node = try s.groupedExpression(fba, expr_node);
                         }
@@ -1347,19 +1348,21 @@ fn startExpression(
                         parent_precedence = precedence;
                         parent_is_compare = false;
 
-                        const parts = s.consumePacked(packed struct {
-                            end: bool,
-                            sentinel: bool,
-                        }, .{ .end = false, .sentinel = false });
+                        const SliceParts = packed struct {
+                            end: bool = false,
+                            sentinel: bool = false,
+                        };
+                        const slice_parts: SliceParts =
+                            if (tag == .array_access) .{} else s.consumePacked(SliceParts, .{});
 
                         const lhs = try s.reserveNode(fba);
-                        const tag: Ast.Node.Tag, const data: Ast.Node.Data =
-                            if (!parts.end and !parts.sentinel)
-                                .{ .slice_open, .{ .node_and_node = .{
+                        const data_tag: Ast.Node.Tag, const data: Ast.Node.Data =
+                            if (!slice_parts.end and !slice_parts.sentinel)
+                                .{ tag, .{ .node_and_node = .{
                                     lhs,
                                     undefined,
                                 } } }
-                            else if (!parts.sentinel)
+                            else if (!slice_parts.sentinel)
                                 .{ .slice, .{ .node_and_extra = .{
                                     lhs,
                                     try s.addExtra(fba, Ast.Node.Slice, undefined),
@@ -1369,23 +1372,23 @@ fn startExpression(
                                     lhs,
                                     try s.addExtra(fba, Ast.Node.SliceSentinel, .{
                                         .start = undefined,
-                                        .end = if (parts.end) undefined else .none,
+                                        .end = if (slice_parts.end) undefined else .none,
                                         .sentinel = undefined,
                                     }),
                                 } } };
 
                         s.nodes.set(@intFromEnum(expr_node), .{
-                            .tag = tag,
+                            .tag = data_tag,
                             .main_token = undefined,
                             .data = data,
                         });
                         try s.stack.append(.{
                             .node = expr_node,
-                            .data = .{ .slice = .{
-                                .start = true,
-                                .dots = true,
-                                .end = parts.end,
-                                .sentinel = parts.sentinel,
+                            .data = .{ .bracket_suffix = .{
+                                .index = true,
+                                .dots = tag != .array_access,
+                                .end_index = slice_parts.end,
+                                .sentinel = slice_parts.sentinel,
                             } },
                         });
                         expr_node = lhs;
@@ -1557,7 +1560,11 @@ fn startExpression(
                         });
                         expr_node = subexpr;
                     },
-                    .block,
+                    .array_type,
+                    .ptr_type,
+                    .optional_type,
+                    .error_set_decl,
+                    .error_union,
                     .@"resume",
                     .@"break",
                     .@"continue",
@@ -1567,12 +1574,7 @@ fn startExpression(
                     .@"for",
                     .@"switch",
                     .while_cont,
-                    .array_type,
-                    .ptr_type,
-                    .optional_type,
-                    .error_set_decl,
-                    .error_union,
-                    .array_access,
+                    .block,
                     => {
                         s.nodes.set(@intFromEnum(expr_node), .{
                             .tag = .identifier,
