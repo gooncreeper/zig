@@ -223,7 +223,10 @@ fn consumeStack(s: *Smith, fba: Allocator) Error!void {
         .array_init_dot,
         .struct_init,
         .struct_init_dot,
-        => |tag| try s.initListMember(fba, tag),
+        .call,
+        .async_call,
+        .builtin_call,
+        => |tag| try s.listMember(fba, tag),
         .slice,
         .slice_open,
         .slice_sentinel,
@@ -523,6 +526,7 @@ fn numberLiteralToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
 
 fn opTagPrecedence(tag: Ast.Node.Tag) u8 {
     return switch (tag) {
+        .async_call,
         .@"break",
         .@"comptime",
         .@"continue",
@@ -533,7 +537,6 @@ fn opTagPrecedence(tag: Ast.Node.Tag) u8 {
         .@"return",
         .while_cont,
         => 1,
-        .async_call,
         .call,
         .field_access,
         .deref,
@@ -638,41 +641,78 @@ fn identifierToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
     return token;
 }
 
-fn endCurlyMembers(
+fn builtinToken(s: *Smith, fba: Allocator) Error!Ast.TokenIndex {
+    const builtins = zig.BuiltinFn.list.keys();
+    // We allow outputing a known builtin or a custom builtin
+    const i = (s.consumeByte() orelse 0) % (builtins.len + 1);
+    const basename = if (i != builtins.len) builtins[i][1..] else blk: {
+        const len, const data_len = for (0.., s.in) |j, c| switch (c) {
+            '0'...'9' => if (j == 0) break .{ j, j + 1 },
+            'a'...'z', 'A'...'Z', '_' => {},
+            else => break .{ j, j + 1 },
+        } else .{ s.in.len, s.in.len };
+        defer s.in = s.in[data_len..];
+        break :blk if (len == 0) "_" else s.in[0..len];
+    };
+    const token = try s.addToken(fba, .builtin);
+    try s.ensureUnusedSourceCapacity(fba, basename.len + 1);
+    s.source.appendAssumeCapacity('@');
+    s.source.appendSliceAssumeCapacity(basename);
+    return token;
+}
+
+fn isTrailing(s: *Smith) bool {
+    return switch (s.tokens.items(.tag)[s.tokens.len - 1]) {
+        .comma, .semicolon => true,
+        else => false,
+    };
+}
+
+fn endListMembers(
     s: *Smith,
     fba: Allocator,
-    item: StackItem,
+    node: Ast.Node.Index,
     members: Members,
     many: Ast.Node.Tag,
     many_trailing: Ast.Node.Tag,
-    two: Ast.Node.Tag,
-    two_trailing: Ast.Node.Tag,
+    short: Ast.Node.Tag,
+    short_trailing: Ast.Node.Tag,
 ) Error!void {
+    const indexes = members.indexes;
     const nodes_slice = s.nodes.slice();
-    const trailing = s.tokens.items(.tag)[s.tokens.len - 1] == .comma;
-    if (members.indexes.len > 2) {
-        nodes_slice.items(.tag)[@intFromEnum(item.node)] = if (!trailing) many else many_trailing;
-        nodes_slice.items(.data)[@intFromEnum(item.node)] = .{
-            .extra_range = try members.toSpan(s, fba),
-        };
-    } else {
-        nodes_slice.items(.tag)[@intFromEnum(item.node)] = if (!trailing) two else two_trailing;
-        nodes_slice.items(.data)[@intFromEnum(item.node)] = .{
-            .opt_node_and_opt_node = members.toTwo(),
-        };
+    const trailing = s.isTrailing();
+    const data = &nodes_slice.items(.data)[@intFromEnum(node)];
+    const tag = &nodes_slice.items(.tag)[@intFromEnum(node)];
+    switch (short) {
+        .container_decl_two,
+        .tagged_union_two,
+        .array_init_dot_two,
+        .struct_init_dot_two,
+        .builtin_call_two,
+        => if (indexes.len > 2) {
+            tag.* = if (!trailing) many else many_trailing;
+            data.* = .{ .extra_range = try members.toSpan(s, fba) };
+        } else {
+            tag.* = if (!trailing) short else short_trailing;
+            data.* = .{ .opt_node_and_opt_node = members.toTwo() };
+        },
+        .array_init_one,
+        .struct_init_one,
+        .call_one,
+        .async_call_one,
+        => if (indexes.len > 1) {
+            tag.* = if (!trailing) many else many_trailing;
+            data.node_and_extra[1] = try members.toExtraSpan(s, fba);
+        } else {
+            tag.* = if (!trailing) short else short_trailing;
+            const member = if (indexes.len == 1) indexes.constSlice()[0].toOptional() else .none;
+            data.* = if (short != .array_init_one)
+                .{ .node_and_opt_node = .{ data.node_and_extra[0], member } }
+            else
+                .{ .node_and_node = .{ data.node_and_extra[0], member.unwrap().? } };
+        },
+        else => unreachable,
     }
-}
-
-fn endTaggedContainer(s: *Smith, fba: Allocator, trailing_tag: Ast.Node.Tag) Error!void {
-    const item = s.stack.constSlice()[s.stack.len - 1];
-    const nodes_slice = s.nodes.slice();
-
-    if (s.tokens.items(.tag)[s.tokens.len - 1] == .comma) {
-        nodes_slice.items(.tag)[@intFromEnum(item.node)] = trailing_tag;
-    }
-
-    const sub_range = try item.data.container.members.toExtraSpan(s, fba);
-    nodes_slice.items(.data)[@intFromEnum(item.node)].node_and_extra[1] = sub_range;
 }
 
 fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
@@ -804,32 +844,39 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
         .root => s.nodes.items(.data)[@intFromEnum(item.node)] = .{
             .extra_range = try container.members.toSpan(s, fba),
         },
-        .container_decl => try s.endCurlyMembers(
+        .container_decl => try s.endListMembers(
             fba,
-            item.*,
+            item.node,
             container.members,
             .container_decl,
             .container_decl_trailing,
             .container_decl_two,
             .container_decl_two_trailing,
         ),
-        .tagged_union => try s.endCurlyMembers(
+        .tagged_union => try s.endListMembers(
             fba,
-            item.*,
+            item.node,
             container.members,
             .tagged_union,
             .tagged_union_trailing,
             .tagged_union_two,
             .tagged_union_two_trailing,
         ),
-        .container_decl_arg => try s.endTaggedContainer(
-            fba,
-            .container_decl_arg_trailing,
-        ),
-        .tagged_union_enum_tag => try s.endTaggedContainer(
-            fba,
-            .tagged_union_enum_tag_trailing,
-        ),
+        // There are no short list varients for these, so they need to be handled seperately
+        .container_decl_arg,
+        .tagged_union_enum_tag,
+        => {
+            const final_tag: Ast.Node.Tag = if (!s.isTrailing()) tag else switch (tag) {
+                .container_decl_arg => .container_decl_arg_trailing,
+                .tagged_union_enum_tag => .tagged_union_enum_tag_trailing,
+                else => unreachable,
+            };
+            const sub_range = try item.data.container.members.toExtraSpan(s, fba);
+
+            const nodes_slice = s.nodes.slice();
+            nodes_slice.items(.tag)[@intFromEnum(item.node)] = final_tag;
+            nodes_slice.items(.data)[@intFromEnum(item.node)].node_and_extra[1] = sub_range;
+        },
         else => unreachable,
     }
     if (tag != .root) _ = try s.outputToken(fba, .r_brace);
@@ -838,13 +885,28 @@ fn containerMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     s.stack.len -= 1;
 }
 
-fn initListMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
+fn listMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
     const item = &s.stack.slice()[s.stack.len - 1];
     const members = &item.data.members;
     const nodes_slice = s.nodes.slice();
 
+    const list_open: Token.Tag, const list_close: Token.Tag = switch (tag) {
+        .array_init,
+        .array_init_dot,
+        .struct_init,
+        .struct_init_dot,
+        => .{ .l_brace, .r_brace },
+        .call,
+        .async_call,
+        .builtin_call,
+        => .{ .l_paren, .r_paren },
+        else => unreachable,
+    };
     if (members.indexes.len == 0) {
-        nodes_slice.items(.main_token)[@intFromEnum(item.node)] = try s.outputToken(fba, .l_brace);
+        const main_token = try s.outputToken(fba, list_open);
+        if (tag != .builtin_call) {
+            nodes_slice.items(.main_token)[@intFromEnum(item.node)] = main_token;
+        }
     }
 
     const ending = s.consumePacked(packed struct {
@@ -854,59 +916,80 @@ fn initListMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
 
     if (ending.end and switch (tag) {
         .array_init, .array_init_dot => members.indexes.len != 0,
-        .struct_init, .struct_init_dot => true,
+        .call, .async_call, .builtin_call, .struct_init, .struct_init_dot => true,
         else => unreachable,
     }) {
-        const trailing = members.indexes.len != 0 and ending.comma;
-        if (trailing) _ = try s.outputToken(fba, .comma);
+        if (members.indexes.len != 0 and ending.comma) {
+            _ = try s.outputToken(fba, .comma);
+        }
 
-        const tag_ptr = &nodes_slice.items(.tag)[@intFromEnum(item.node)];
-        const data_ptr = &nodes_slice.items(.data)[@intFromEnum(item.node)];
         switch (tag) {
-            .array_init => if (members.indexes.len <= 1) {
-                tag_ptr.* = if (!trailing) .array_init_one else .array_init_one_comma;
-                data_ptr.* = .{ .node_and_node = .{
-                    data_ptr.node_and_extra[0],
-                    members.indexes.constSlice()[0],
-                } };
-            } else {
-                tag_ptr.* = if (!trailing) .array_init else .array_init_comma;
-                data_ptr.node_and_extra[1] = try members.toExtraSpan(s, fba);
-            },
-            .struct_init => if (members.indexes.len <= 1) {
-                tag_ptr.* = if (!trailing) .struct_init_one else .struct_init_one_comma;
-                data_ptr.* = .{ .node_and_opt_node = .{
-                    data_ptr.node_and_extra[0],
-                    if (members.indexes.len == 1)
-                        members.indexes.constSlice()[0].toOptional()
-                    else
-                        .none,
-                } };
-            } else {
-                tag_ptr.* = if (!trailing) .struct_init else .struct_init_comma;
-                data_ptr.node_and_extra[1] = try members.toExtraSpan(s, fba);
-            },
-            .array_init_dot => try s.endCurlyMembers(
+            .array_init => try s.endListMembers(
                 fba,
-                item.*,
+                item.node,
+                members.*,
+                .array_init,
+                .array_init_comma,
+                .array_init_one,
+                .array_init_one_comma,
+            ),
+            .struct_init => try s.endListMembers(
+                fba,
+                item.node,
+                members.*,
+                .struct_init,
+                .struct_init_comma,
+                .struct_init_one,
+                .struct_init_one_comma,
+            ),
+            .array_init_dot => try s.endListMembers(
+                fba,
+                item.node,
                 members.*,
                 .array_init_dot,
                 .array_init_dot_comma,
                 .array_init_dot_two,
                 .array_init_dot_two_comma,
             ),
-            .struct_init_dot => try s.endCurlyMembers(
+            .struct_init_dot => try s.endListMembers(
                 fba,
-                item.*,
+                item.node,
                 members.*,
                 .struct_init_dot,
                 .struct_init_dot_comma,
                 .struct_init_dot_two,
                 .struct_init_dot_two_comma,
             ),
+            .builtin_call => try s.endListMembers(
+                fba,
+                item.node,
+                members.*,
+                .builtin_call,
+                .builtin_call_comma,
+                .builtin_call_two,
+                .builtin_call_two_comma,
+            ),
+            .call => try s.endListMembers(
+                fba,
+                item.node,
+                members.*,
+                .call,
+                .call_comma,
+                .call_one,
+                .call_one_comma,
+            ),
+            .async_call => try s.endListMembers(
+                fba,
+                item.node,
+                members.*,
+                .async_call,
+                .async_call_comma,
+                .async_call_one,
+                .async_call_one_comma,
+            ),
             else => unreachable,
         }
-        _ = try s.outputToken(fba, .r_brace);
+        _ = try s.outputToken(fba, list_close);
 
         item.* = undefined;
         s.stack.len -= 1;
@@ -922,7 +1005,12 @@ fn initListMember(s: *Smith, fba: Allocator, tag: Ast.Node.Tag) Error!void {
             _ = try s.identifierToken(fba);
             _ = try s.outputToken(fba, .equal);
         },
-        .array_init, .array_init_dot => {},
+        .array_init,
+        .array_init_dot,
+        .call,
+        .async_call,
+        .builtin_call,
+        => {},
         else => unreachable,
     }
     const expr = try s.startExpression(fba, null, false);
@@ -1396,6 +1484,19 @@ fn startExpression(
                             break;
                         }
                     },
+                    .array_init_dot, .struct_init_dot => |tag| {
+                        _ = try s.outputToken(fba, .period);
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = undefined,
+                            .data = undefined,
+                        });
+                        try s.stack.append(.{
+                            .node = expr_node,
+                            .data = .{ .members = .{} },
+                        });
+                        break;
+                    },
                     .array_init, .struct_init => |tag| {
                         const precedence = opTagPrecedence(tag);
                         if (is_type_expr or precedence > parent_precedence) {
@@ -1417,11 +1518,10 @@ fn startExpression(
                         });
                         expr_node = typeexpr;
                     },
-                    .array_init_dot, .struct_init_dot => |tag| {
-                        _ = try s.outputToken(fba, .period);
+                    .builtin_call => {
                         s.nodes.set(@intFromEnum(expr_node), .{
-                            .tag = tag,
-                            .main_token = undefined,
+                            .tag = .builtin_call,
+                            .main_token = try s.builtinToken(fba),
                             .data = undefined,
                         });
                         try s.stack.append(.{
@@ -1429,6 +1529,33 @@ fn startExpression(
                             .data = .{ .members = .{} },
                         });
                         break;
+                    },
+                    .call, .async_call => |tag| {
+                        const precedence = opTagPrecedence(tag);
+                        if (is_type_expr or precedence > parent_precedence) {
+                            expr_node = try s.groupedExpression(fba, expr_node);
+                        }
+                        is_type_expr = true;
+                        parent_precedence = precedence;
+                        parent_is_compare = false;
+
+                        switch (tag) {
+                            .call => {},
+                            .async_call => _ = try s.outputToken(fba, .keyword_async),
+                            else => unreachable,
+                        }
+
+                        const subexpr = try s.reserveNode(fba);
+                        s.nodes.set(@intFromEnum(expr_node), .{
+                            .tag = tag,
+                            .main_token = undefined,
+                            .data = .{ .node_and_extra = .{ subexpr, undefined } },
+                        });
+                        try s.stack.append(.{
+                            .node = expr_node,
+                            .data = .{ .members = .{} },
+                        });
+                        expr_node = subexpr;
                     },
                     .block,
                     .@"resume",
@@ -1440,9 +1567,6 @@ fn startExpression(
                     .@"for",
                     .@"switch",
                     .while_cont,
-                    .async_call,
-                    .call,
-                    .builtin_call,
                     .array_type,
                     .ptr_type,
                     .optional_type,
@@ -1464,6 +1588,7 @@ fn startExpression(
                         {
                             expr_node = try s.groupedExpression(fba, expr_node);
                         }
+                        is_type_expr = true;
                         parent_precedence = precedence;
                         parent_is_compare = false;
 

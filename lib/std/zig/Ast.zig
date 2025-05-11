@@ -3776,7 +3776,7 @@ pub const Node = struct {
         /// The `main_token` field is the `struct`, `union`, `opaque` or `enum` token.
         container_decl,
         /// Same as `container_decl` except there is known to be a trailing
-        /// comma before the final rbrace.
+        /// comma or semicolon before the final rbrace.
         container_decl_trailing,
         /// `struct {lhs, rhs}`, `union {lhs, rhs}`, `opaque {lhs, rhs}`, `enum {lhs, rhs}`.
         ///
@@ -3787,7 +3787,7 @@ pub const Node = struct {
         /// The `main_token` field is the `struct`, `union`, `opaque` or `enum` token.
         container_decl_two,
         /// Same as `container_decl_two` except there is known to be a trailing
-        /// comma before the final rbrace.
+        /// comma or semicolon before the final rbrace.
         container_decl_two_trailing,
         /// `struct(arg)`, `union(arg)`, `enum(arg)`.
         ///
@@ -3799,7 +3799,7 @@ pub const Node = struct {
         /// The `main_token` field is the `struct`, `union` or `enum` token.
         container_decl_arg,
         /// Same as `container_decl_arg` except there is known to be a trailing
-        /// comma before the final rbrace.
+        /// comma or semicolon before the final rbrace.
         container_decl_arg_trailing,
         /// `union(enum) {}`.
         ///
@@ -3811,8 +3811,8 @@ pub const Node = struct {
         /// A tagged union with explicitly provided enums will instead be
         /// represented by `container_decl_arg`.
         tagged_union,
-        /// Same as `tagged_union` except there is known to be a trailing comma
-        /// before the final rbrace.
+        /// Same as `tagged_union` except there is known to be a trailing
+        /// comma or semicolon before the final rbrace.
         tagged_union_trailing,
         /// `union(enum) {lhs, rhs}`.
         ///
@@ -3826,7 +3826,7 @@ pub const Node = struct {
         /// represented by `container_decl_arg`.
         tagged_union_two,
         /// Same as `tagged_union_two` except there is known to be a trailing
-        /// comma before the final rbrace.
+        /// comma or semicolon before the final rbrace.
         tagged_union_two_trailing,
         /// `union(enum(arg)) {}`.
         ///
@@ -3838,7 +3838,7 @@ pub const Node = struct {
         /// The `main_token` field is the `union` token.
         tagged_union_enum_tag,
         /// Same as `tagged_union_enum_tag` except there is known to be a
-        /// trailing comma before the final rbrace.
+        /// trailing comma or semicolon before the final rbrace.
         tagged_union_enum_tag_trailing,
         /// `a: lhs = rhs,`,
         /// `a: lhs,`.
