@@ -172,7 +172,7 @@ const MatchLength = struct {
 //
 pub const length_codes_start = 257;
 
-const match_lengths = [_]MatchLength{
+pub const match_lengths = [_]MatchLength{
     .{ .extra_bits = 0, .base_scaled = 0, .base = 3, .code = 257 },
     .{ .extra_bits = 0, .base_scaled = 1, .base = 4, .code = 258 },
     .{ .extra_bits = 0, .base_scaled = 2, .base = 5, .code = 259 },
@@ -248,7 +248,7 @@ const MatchDistance = struct {
 //   8   3  17-24   18   8    513-768   28   13 16385-24576
 //   9   3  25-32   19   8   769-1024   29   13 24577-32768
 //
-const match_distances = [_]MatchDistance{
+pub const match_distances = [_]MatchDistance{
     .{ .extra_bits = 0, .base_scaled = 0x0000, .code = 0, .base = 1 },
     .{ .extra_bits = 0, .base_scaled = 0x0001, .code = 1, .base = 2 },
     .{ .extra_bits = 0, .base_scaled = 0x0002, .code = 2, .base = 3 },

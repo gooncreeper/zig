@@ -39,6 +39,8 @@ const State = union(enum) {
     block_header,
     stored_block: u16,
     fixed_block,
+    fixed_block_literal: u8,
+    fixed_block_match: u16,
     dynamic_block,
     dynamic_block_literal: u8,
     dynamic_block_match: u16,
@@ -389,8 +391,14 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
                 const code = try d.readFixedCode();
                 switch (code) {
                     0...255 => {
-                        try w.writeBytePreserve(flate.history_len, @intCast(code));
-                        remaining -= 1;
+                        if (remaining != 0) {
+                            @branchHint(.likely);
+                            try w.writeBytePreserve(flate.history_len, @intCast(code));
+                            remaining -= 1;
+                        } else {
+                            d.state = .{ .fixed_block_literal = @intCast(code) };
+                            return @intFromEnum(limit);
+                        }
                     },
                     256 => {
                         d.state = if (d.final_block) .protocol_footer else .block_header;
@@ -400,15 +408,31 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
                         // Handles fixed block non literal (length) code.
                         // Length code is followed by 5 bits of distance code.
                         const length = try d.decodeLength(@intCast(code - 257));
-                        const distance = try d.decodeDistance(@bitReverse(try d.takeBits(u5)));
-                        try writeMatch(w, length, distance);
-                        remaining -= length;
+                        continue :sw .{ .fixed_block_match = length };
                     },
                     else => return error.InvalidCode,
                 }
             }
             d.state = .fixed_block;
             return @intFromEnum(limit) - remaining;
+        },
+        .fixed_block_literal => |symbol| {
+            assert(remaining != 0);
+            remaining -= 1;
+            try w.writeBytePreserve(flate.history_len, symbol);
+            continue :sw .fixed_block;
+        },
+        .fixed_block_match => |length| {
+            if (remaining >= length) {
+                @branchHint(.likely);
+                const distance = try d.decodeDistance(@bitReverse(try d.takeBits(u5)));
+                try writeMatch(w, length, distance);
+                remaining -= length;
+                continue :sw .fixed_block;
+            } else {
+                d.state = .{ .fixed_block_match = length };
+                return @intFromEnum(limit) - remaining;
+            }
         },
         .dynamic_block => {
             // In larger archives most blocks are usually dynamic, so
@@ -424,7 +448,7 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
                         continue :sym sym.kind;
                     } else {
                         d.state = .{ .dynamic_block_literal = sym.symbol };
-                        return @intFromEnum(limit) - remaining;
+                        return @intFromEnum(limit);
                     }
                 },
                 .match => {
@@ -792,7 +816,7 @@ fn HuffmanDecoder(
             }
             if (left > 0) { // left > 0 means incomplete
                 // incomplete code ok only for single length 1 code
-                if (max_code_bits > 7 and max == count[0] + count[1]) return;
+                if (alphabet_size != 19 and max_code_bits > 7 and max == count[0] + count[1]) return;
                 return error.IncompleteHuffmanTree;
             }
         }
@@ -1273,4 +1297,8 @@ fn testDecompress(container: Container, compressed: []const u8, expected_plain: 
     const decompressed_len = try decompress.reader.streamRemaining(&aw.writer);
     try testing.expectEqual(expected_plain.len, decompressed_len);
     try testing.expectEqualSlices(u8, expected_plain, aw.getWritten());
+}
+
+test {
+    _ = &@import("decompress_fuzz.zig");
 }
