@@ -24,7 +24,7 @@ pub const MultiArrayList = @import("multi_array_list.zig").MultiArrayList;
 pub const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 pub const PriorityDequeue = @import("priority_dequeue.zig").PriorityDequeue;
 pub const Progress = @import("Progress.zig");
-pub const Random = @import("Random.zig");
+pub const random = @import("random.zig");
 pub const SegmentedList = @import("segmented_list.zig").SegmentedList;
 pub const SemanticVersion = @import("SemanticVersion.zig");
 pub const SinglyLinkedList = @import("SinglyLinkedList.zig");
@@ -141,11 +141,18 @@ pub const Options = struct {
 
     fmt_max_depth: usize = fmt.default_max_depth,
 
-    cryptoRandomSeed: fn (buffer: []u8) void = @import("crypto/tlcsprng.zig").defaultRandomSeed,
-
-    crypto_always_getrandom: bool = false,
-
-    crypto_fork_safety: bool = true,
+    tlcsprng: struct {
+        /// `r` is provided by tlcsprng and there are no gaurauntees on its buffer capacity.
+        /// On error, `crypto.tlcsprng.random.err` msut be populated.
+        get_random: *const Io.Reader.VTable = crypto.tlcsprng.default_get_random,
+        /// Field type of `crypto.rng.err``
+        GetRandomError: type = crypto.tlcsprng.DefaultGetRandomError,
+        /// Make every tlcsprng fill use get_random instead of using a CSPRNG or
+        /// other source. Otherwise, get_random is only used to seed CSPRNGs.
+        getrandom_only: bool = false,
+        /// Prevents randomness state from being reused by forks.
+        fork_safety: bool = true,
+    } = .{},
 
     /// By default Zig disables SIGPIPE by setting a "no-op" handler for it.  Set this option
     /// to `true` to prevent that.

@@ -480,7 +480,8 @@ fn make(step: *Step, make_options: Step.MakeOptions) !void {
                 });
             };
 
-            const rand_int = std.crypto.random.int(u64);
+            const rand_int = std.random.int(&std.crypto.tlcsprng.random.reader, u64) catch |err|
+                std.debug.panic("tlcpsrng failed to provide entronopy: {t}", .{err});
             const tmp_sub_path = "tmp" ++ fs.path.sep_str ++
                 std.fmt.hex(rand_int) ++ fs.path.sep_str ++
                 basename;

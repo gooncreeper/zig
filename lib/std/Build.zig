@@ -2621,7 +2621,8 @@ pub const InstallDir = union(enum) {
 /// source of API breakage in the future, so keep that in mind when using this
 /// function.
 pub fn makeTempPath(b: *Build) []const u8 {
-    const rand_int = std.crypto.random.int(u64);
+    const rand_int = std.random.int(&std.crypto.tlcsprng.random.reader, u64) catch |err|
+        panic("tlcpsrng failed to provide entronopy: {t}", .{err});
     const tmp_dir_sub_path = "tmp" ++ fs.path.sep_str ++ std.fmt.hex(rand_int);
     const result_path = b.cache_root.join(b.allocator, &.{tmp_dir_sub_path}) catch @panic("OOM");
     b.cache_root.handle.makePath(tmp_dir_sub_path) catch |err| {

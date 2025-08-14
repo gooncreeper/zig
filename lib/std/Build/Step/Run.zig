@@ -856,7 +856,8 @@ fn make(step: *Step, options: Step.MakeOptions) !void {
     };
 
     // We do not know the final output paths yet, use temp paths to run the command.
-    const rand_int = std.crypto.random.int(u64);
+    const rand_int = std.random.int(&std.crypto.tlcsprng.random.reader, u64) catch |err|
+        std.debug.panic("tlcpsrng failed to provide entronopy: {t}", .{err});
     const tmp_dir_path = "tmp" ++ fs.path.sep_str ++ std.fmt.hex(rand_int);
 
     for (output_placeholders.items) |placeholder| {
@@ -980,7 +981,8 @@ pub fn rerunInFuzzMode(
         }
     }
     const has_side_effects = false;
-    const rand_int = std.crypto.random.int(u64);
+    const rand_int = std.random.int(&std.crypto.tlcsprng.random.reader, u64) catch |err|
+        std.debug.panic("tlcpsrng failed to provide entronopy: {t}", .{err});
     const tmp_dir_path = "tmp" ++ fs.path.sep_str ++ std.fmt.hex(rand_int);
     try runCommand(run, argv_list.items, has_side_effects, tmp_dir_path, prog_node, .{
         .unit_test_index = unit_test_index,

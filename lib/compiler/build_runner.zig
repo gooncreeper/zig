@@ -20,7 +20,7 @@ pub const dependencies = @import("@dependencies");
 pub const std_options: std.Options = .{
     .side_channels_mitigations = .none,
     .http_disable_tls = true,
-    .crypto_fork_safety = false,
+    .tlcsprng = .{ .fork_safety = false },
 };
 
 pub fn main() !void {
@@ -611,13 +611,14 @@ fn prepare(
 
     const starting_steps = try arena.dupe(*Step, step_stack.keys());
 
-    var rng = std.Random.DefaultPrng.init(seed);
-    const rand = rng.random();
-    rand.shuffle(*Step, starting_steps);
+    var rng_buf: [1024]u8 = undefined;
+    var rng: std.random.DefaultPrng = .init(&rng_buf, seed);
+    try std.random.shuffle(&rng.reader, *Step, starting_steps);
 
     for (starting_steps) |s| {
-        constructGraphAndCheckForDependencyLoop(gpa, b, s, &run.step_stack, rand) catch |err| switch (err) {
+        constructGraphAndCheckForDependencyLoop(gpa, b, s, &run.step_stack, &rng.reader) catch |err| switch (err) {
             error.DependencyLoopDetected => return uncleanExit(),
+            error.ReadFailed, error.EndOfStream => unreachable, // prng cannot fail
             else => |e| return e,
         };
     }
@@ -1060,7 +1061,7 @@ fn constructGraphAndCheckForDependencyLoop(
     b: *std.Build,
     s: *Step,
     step_stack: *std.AutoArrayHashMapUnmanaged(*Step, void),
-    rand: std.Random,
+    rng: *std.Io.Reader,
 ) !void {
     switch (s.state) {
         .precheck_started => {
@@ -1077,12 +1078,12 @@ fn constructGraphAndCheckForDependencyLoop(
             const deps = gpa.dupe(*Step, s.dependencies.items) catch @panic("OOM");
             defer gpa.free(deps);
 
-            rand.shuffle(*Step, deps);
+            try std.random.shuffle(rng, *Step, deps);
 
             for (deps) |dep| {
                 try step_stack.put(gpa, dep, {});
                 try dep.dependants.append(b.allocator, s);
-                constructGraphAndCheckForDependencyLoop(gpa, b, dep, step_stack, rand) catch |err| {
+                constructGraphAndCheckForDependencyLoop(gpa, b, dep, step_stack, rng) catch |err| {
                     if (err == error.DependencyLoopDetected) {
                         std.debug.print("  {s}\n", .{s.name});
                     }

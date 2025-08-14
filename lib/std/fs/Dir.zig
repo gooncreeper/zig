@@ -1909,7 +1909,8 @@ pub fn atomicSymLink(
     const temp_path = temp_path_buf[0..temp_path_len];
 
     while (true) {
-        const random_integer = std.crypto.random.int(u64);
+        const random_integer = std.random.int(&std.crypto.tlcsprng.random.reader, u64) catch
+            return std.crypto.tlcsprng.random.err.?;
         temp_path[dirname.len + 1 ..][0..rand_len].* = std.fmt.hex(random_integer);
 
         if (dir.symLink(target_path, temp_path, flags)) {

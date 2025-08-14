@@ -10,13 +10,14 @@
 const std = @import("../std.zig");
 const builtin = @import("builtin");
 const math = std.math;
-const Random = std.Random;
+const random = std.random;
+const Reader = std.Io.Reader;
 
-pub fn next_f64(random: Random, comptime tables: ZigTable) f64 {
+pub fn next_f64(r: *Reader, comptime tables: ZigTable) Reader.Error!f64 {
     while (true) {
         // We manually construct a float from parts as we can avoid an extra random lookup here by
         // using the unused exponent for the lookup table entry.
-        const bits = random.int(u64);
+        const bits = try random.int(r, u64);
         const i = @as(usize, @as(u8, @truncate(bits)));
 
         const u = blk: {
@@ -40,11 +41,11 @@ pub fn next_f64(random: Random, comptime tables: ZigTable) f64 {
         }
 
         if (i == 0) {
-            return tables.zero_case(random, u);
+            return tables.zero_case(r, u);
         }
 
         // equivalent to f1 + DRanU() * (f0 - f1) < 1
-        if (tables.f[i + 1] + (tables.f[i] - tables.f[i + 1]) * random.float(f64) < tables.pdf(x)) {
+        if (tables.f[i + 1] + (tables.f[i] - tables.f[i + 1]) * try random.float(r, f64) < tables.pdf(x)) {
             return x;
         }
     }
@@ -60,7 +61,7 @@ pub const ZigTable = struct {
     // whether the distribution is symmetric
     is_symmetric: bool,
     // fallback calculation in the case we are in the 0 block
-    zero_case: fn (Random, f64) f64,
+    zero_case: fn (Reader, f64) f64,
 };
 
 // zigNorInit
@@ -70,7 +71,7 @@ pub fn ZigTableGen(
     comptime v: f64,
     comptime f: fn (f64) f64,
     comptime f_inv: fn (f64) f64,
-    comptime zero_case: fn (Random, f64) f64,
+    comptime zero_case: fn (Reader, f64) f64,
 ) ZigTable {
     var tables: ZigTable = undefined;
 
@@ -110,13 +111,13 @@ pub fn norm_f(x: f64) f64 {
 pub fn norm_f_inv(y: f64) f64 {
     return @sqrt(-2.0 * @log(y));
 }
-pub fn norm_zero_case(random: Random, u: f64) f64 {
+pub fn norm_zero_case(r: Reader, u: f64) Reader.Error!f64 {
     var x: f64 = 1;
     var y: f64 = 0;
 
     while (-2.0 * y < x * x) {
-        x = @log(random.float(f64)) / norm_r;
-        y = @log(random.float(f64));
+        x = @log(try random.float(r, f64)) / norm_r;
+        y = @log(try random.float(r, f64));
     }
 
     if (u < 0) {
@@ -129,12 +130,12 @@ pub fn norm_zero_case(random: Random, u: f64) f64 {
 test "normal dist smoke test" {
     // Hardcode 0 as the seed because it's possible a seed exists that fails
     // this test.
-    var prng = Random.DefaultPrng.init(0);
-    const random = prng.random();
+    var buf: [4096]u8 = undefined;
+    var prng: random.DefaultPrng = .init(0, &buf);
 
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        _ = random.floatNorm(f64);
+        _ = try random.floatNorm(&prng.reader, f64);
     }
 }
 
@@ -153,17 +154,17 @@ pub fn exp_f(x: f64) f64 {
 pub fn exp_f_inv(y: f64) f64 {
     return -@log(y);
 }
-pub fn exp_zero_case(random: Random, _: f64) f64 {
-    return exp_r - @log(random.float(f64));
+pub fn exp_zero_case(r: Reader, _: f64) f64 {
+    return exp_r - @log(random.float(r, f64));
 }
 
 test "exp dist smoke test" {
-    var prng = Random.DefaultPrng.init(0);
-    const random = prng.random();
+    var buf: [4096]u8 = undefined;
+    var prng: random.DefaultPrng = .init(0, &buf);
 
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        _ = random.floatExp(f64);
+        _ = random.floatExp(&prng.reader, f64);
     }
 }
 

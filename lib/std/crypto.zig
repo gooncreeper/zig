@@ -211,7 +211,8 @@ pub const nacl = struct {
 pub const ff = @import("crypto/ff.zig");
 
 /// This is a thread-local, cryptographically secure pseudo random number generator.
-pub const random = @import("crypto/tlcsprng.zig").interface;
+// It is not possible to point this directly at tlcsprng.random since it is thread-local.
+pub const tlcsprng = @import("crypto/tlcsprng.zig");
 
 /// Encoding and decoding
 pub const codecs = @import("crypto/codecs.zig");
@@ -330,17 +331,17 @@ test {
     _ = secureZero;
     _ = timing_safe;
     _ = ff;
-    _ = random;
+    _ = tlcsprng;
     _ = errors;
     _ = tls;
     _ = Certificate;
     _ = codecs;
 }
 
-test "CSPRNG" {
-    const a = random.int(u64);
-    const b = random.int(u64);
-    const c = random.int(u64);
+test "Thread-local CSPRNG" {
+    const a = std.random.int(&tlcsprng.random.reader, u64);
+    const b = std.random.int(&tlcsprng.random.reader, u64);
+    const c = std.random.int(&tlcsprng.random.reader, u64);
     try std.testing.expect(a ^ b ^ c != 0);
 }
 

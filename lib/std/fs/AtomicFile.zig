@@ -14,7 +14,7 @@ file_exists: bool,
 close_dir_on_deinit: bool,
 dir: Dir,
 
-pub const InitError = File.OpenError;
+pub const InitError = File.OpenError || std.crypto.tlcsprng.Error;
 
 /// Note that the `Dir.atomicFile` API may be more handy than this lower-level function.
 pub fn init(
@@ -25,7 +25,8 @@ pub fn init(
     write_buffer: []u8,
 ) InitError!AtomicFile {
     while (true) {
-        const random_integer = std.crypto.random.int(u64);
+        const random_integer = std.random.int(&std.crypto.tlcsprng.random.reader, u64) catch
+            return std.crypto.tlcsprng.random.err.?;
         const tmp_sub_path = std.fmt.hex(random_integer);
         const file = dir.createFile(&tmp_sub_path, .{ .mode = mode, .exclusive = true }) catch |err| switch (err) {
             error.PathAlreadyExists => continue,
